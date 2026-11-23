@@ -1,0 +1,24 @@
+# --- Flipper / ufbt build output ---
+.ufbt/
+.sconsign.dblite
+**/dist/
+**/build/
+*.fap
+
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Android / Gradle ---
+android/.gradle/
+**/.gradle/
+android/local.properties
+*.apk
+*.aab
+
+# --- IDE / tooling ---
+.vscode/
+.idea/
+compile_commands.json

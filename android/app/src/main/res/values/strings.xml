@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">G2 Controller</string>
+    <string name="service_channel_name">G2 Controller Service</string>
+    <string name="service_channel_desc">Maintains BLE connection to Even G2 glasses</string>
+    <string name="notification_title">G2 Controller Active</string>
+    <string name="notification_desc">Tap to open controller</string>
+</resources>

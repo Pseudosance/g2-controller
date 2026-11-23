@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.G2Controller" parent="Theme.MaterialComponents.DayNight.NoActionBar" />
+</resources>

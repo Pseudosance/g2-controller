@@ -1,0 +1,3 @@
+# Icon: 28x28 1-bit PNG
+# Create icon.png with a simple glasses + controller design
+# Then fbt will package it automatically

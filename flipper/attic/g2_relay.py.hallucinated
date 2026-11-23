@@ -1,0 +1,79 @@
+import asyncio
+from bleak import BleakClient, BleakScanner
+
+# Flipper Zero BLE Serial Profile UUIDs
+FLIPPER_SERIAL_SVC = "8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000"
+FLIPPER_TX_CHAR    = "19ed82ae-ed21-4c9d-4145-228e62fe0000"  # Flipper -> Host (Notify)
+
+# Even Realities G2 EUS UUIDs
+G2_EUS_SVC = "00002760-08c2-11e1-9073-0e8ac72e5450"
+G2_TX_CHAR = "00002760-08c2-11e1-9073-0e8ac72e5401"  # Host -> G2 (Write)
+G2_RX_CHAR = "00002760-08c2-11e1-9073-0e8ac72e5402"  # G2 -> Host (Notify)
+
+CMD_MAP = {
+    "SCROLL_UP":   (0x20, b"\x00"),
+    "SCROLL_DOWN": (0x20, b"\x01"),
+    "TAP":         (0x21, b""),
+    "LONG_TAP":    (0x22, b""),
+    "DOUBLE_TAP":  (0x23, b""),
+    "NAV_BACK":    (0x24, b""),
+    "NAV_HOME":    (0x25, b""),
+}
+
+def build_eus_frame(cmd: int, payload: bytes = b"") -> bytes:
+    flag = 0x01
+    length = len(payload) + 1
+    header = bytes([flag, (length >> 8) & 0xFF, length & 0xFF, cmd])
+    body = header + payload
+    checksum = 0
+    for b in body:
+        checksum ^= b
+    return body + bytes([checksum])
+
+async def find_device(name_hint: str, service_uuid: str):
+    print(f"Scanning for {name_hint}...")
+    devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
+    for addr, (dev, adv) in devices.items():
+        uuids = [u.lower() for u in (adv.service_uuids or [])]
+        if service_uuid.lower() in uuids or (dev.name and name_hint.lower() in dev.name.lower()):
+            print(f"Found {dev.name} ({addr})")
+            return dev
+    raise RuntimeError(f"Could not find {name_hint}")
+
+async def main():
+    flipper_dev = await find_device("Flipper", FLIPPER_SERIAL_SVC)
+    g2_dev = await find_device("Even", G2_EUS_SVC)
+
+    async with BleakClient(flipper_dev) as flipper, BleakClient(g2_dev) as g2:
+        print("Connected to both Flipper Zero and Even G2!")
+
+        def on_g2_notify(_, data: bytearray):
+            print(f"[G2 RX] {data.hex()}")
+
+        await g2.start_notify(G2_RX_CHAR, on_g2_notify)
+
+        async def forward_cmd(cmd_name: str):
+            if cmd_name not in CMD_MAP:
+                print(f"[Flipper] Unknown command: {cmd_name}")
+                return
+            opcode, payload = CMD_MAP[cmd_name]
+            frame = build_eus_frame(opcode, payload)
+            print(f"[Relay] {cmd_name} -> {frame.hex()}")
+            await g2.write_gatt_char(G2_TX_CHAR, frame, response=True)
+
+        buf = ""
+        def on_flipper_notify(_, data: bytearray):
+            nonlocal buf
+            buf += data.decode("utf-8", errors="ignore")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                cmd = line.strip()
+                if cmd:
+                    asyncio.create_task(forward_cmd(cmd))
+
+        await flipper.start_notify(FLIPPER_TX_CHAR, on_flipper_notify)
+        print("Relay active. Press buttons on Flipper (Ctrl+C to stop)...")
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())

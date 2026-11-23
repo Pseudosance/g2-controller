@@ -1,0 +1,6 @@
+name: "G2 Controller"
+version: "1.0.0"
+icon: "icon.png"
+requires: ["ble"]
+entry_point: "g2_controller_main"
+stack_size: 8192

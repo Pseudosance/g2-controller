@@ -1,0 +1,15 @@
+App(
+    appid="g2_controller",
+    name="G2 Controller",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="g2_controller_main",
+    requires=[
+        "gui",
+        "bt",
+        "notification",
+    ],
+    stack_size=2048,
+    fap_version="1.1",
+    fap_category="Bluetooth",
+    fap_description="Button remote for Even G2 glasses via a PC BLE relay",
+)
