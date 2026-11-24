@@ -1,0 +1,15 @@
+App(
+    appid="g2_ring",
+    name="G2 Ring",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="g2_ring_app",
+    requires=[
+        "gui",
+        "bt",
+    ],
+    stack_size=2048,
+    fap_version="0.1",
+    fap_category="Bluetooth",
+    fap_description="Impersonates an Even R1 ring: advertises and hosts its GATT gesture service",
+    fap_icon="icon.png",
+)
