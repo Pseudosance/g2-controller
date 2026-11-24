@@ -10,7 +10,7 @@ to each device. Runs on Windows (bleak WinRT backend) or Linux (BlueZ Central).
 
 Line protocol with the Flipper app (newline-terminated, ASCII):
   Flipper -> relay:  TAP | DOUBLE_TAP | LONG_TAP | SCROLL_UP | SCROLL_DOWN |
-                     NAV_BACK | NAV_HOME | STATUS | PING
+                     NAV_BACK | NAV_HOME | STATUS | PING | BYE
   relay -> Flipper:  HELLO <ver> | PONG | LINK 0|1 | PAGE <desc> | INFO <text>
 
 Protocol layer (relay/g2proto.py) is golden-tested against vendor/even-g2-js/g2.js.
@@ -275,6 +275,11 @@ class Relay:
         on_text_page = self.pages[self.page] != "menu"
         if cmd == "PING":
             self.say("PONG")
+            return
+        if cmd == "BYE":
+            # Flipper is closing the app: log and do nothing else (no EVT echo,
+            # no render) so the farewell stays a clean, recognised token.
+            log.info("flipper signed off (BYE)")
             return
         if cmd == "SCROLL_DOWN":
             if on_text_page:

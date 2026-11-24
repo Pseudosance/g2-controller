@@ -97,13 +97,22 @@ file explorer.
 
 18. **UP** (tap) → glasses selection moves up; each tap sends exactly one
     `SCROLL_UP`. The Flipper blinks **blue** once per successful send.
-19. **UP** (hold ~0.5 s) → after a half-second the glasses scroll continuously
+19. **UP** (hold past ~0.5 s) → after the 500 ms auto-repeat grace the glasses scroll continuously
     (auto-repeat ~10 Hz). Release stops it.
 20. **DOWN** (tap / hold) → the same, downwards.
-21. **OK** (short) → one `TAP`: activates the highlighted menu item.
-22. **OK** (double-tap, within 300 ms) → `DOUBLE_TAP`: relay fetches glasses
-    status and the Flipper's info line shows `INFO g2 battery …` (green blink).
-23. **OK** (long press, ≥0.5 s) → `LONG_TAP`: same status ping.
+21. **OK** (short) → one `TAP`: activates the highlighted menu item. NOTE: a lone
+    OK is **deferred** — the app waits out the double-tap window (250 ms) to be
+    sure you are not double-tapping before it emits `TAP`, so there is up to
+    250 ms of latency between your tap and the activation. That delay is
+    deliberate: without it a double-tap would ALSO activate the highlighted item
+    (the menu includes Clear and Re-link, i.e. a stray tap can wipe the display
+    or tear down the glasses session).
+22. **OK** (double-tap: a second OK release within 250 ms) → `DOUBLE_TAP`: relay
+    fetches glasses status and the Flipper's info line shows `INFO g2 battery …`.
+    The Flipper blinks **blue** on a successful send (there is no green blink).
+23. **OK** (long press) → `LONG_TAP`: same status ping. The hold threshold is the
+    firmware's own `InputTypeLong` timing, which the app does **not** control —
+    it is unrelated to the 500 ms scroll auto-repeat grace.
 24. **LEFT** (short) → `NAV_BACK`: glasses go to the previous page.
 25. **RIGHT** (short) → `NAV_HOME`: glasses go to the next page.
 26. **LEFT** (long press) → `STATUS`: explicit status request (this is the
@@ -122,14 +131,15 @@ link (relay gone) — the `last_tx` field shows the line prefixed with `!`.
 | UP hold            | `SCROLL_UP`×N | repeated selection up               |
 | DOWN tap           | `SCROLL_DOWN` | menu selection down                 |
 | DOWN hold          | `SCROLL_DOWN`×N | repeated selection down           |
-| OK short           | `TAP`         | activate highlighted item           |
-| OK double-tap      | `DOUBLE_TAP`  | quick status ping (G2 fetch)        |
+| OK short           | `TAP`         | activate item (after 250 ms deferral) |
+| OK double-tap      | `DOUBLE_TAP`  | quick status ping (single tap suppressed) |
 | OK long press      | `LONG_TAP`    | status ping                         |
 | LEFT short         | `NAV_BACK`    | previous page                       |
 | RIGHT short        | `NAV_HOME`    | next page                           |
 | LEFT long          | `STATUS`      | status ping                         |
 | BACK               | (none)        | exit the app                        |
 | ping timer (2 s)   | `PING`        | reply `PONG`                        |
+| app exit           | `BYE`         | logged, ignored (no echo, no render)|
 
 ---
 
@@ -165,8 +175,9 @@ watch when you first run the stack.
    or the peer isn't subscribed. If `PC relay: linked` never lights but the BLE
    connection exists, the relay may not have subscribed to the Flipper's notify
    characteristic.
-7. **Timing / tuning values.** Double-tap window (300 ms) and scroll auto-repeat
-   (500 ms initial delay, 100 ms period) are chosen for feel and are safe to
-   tune in `g2_controller.c`; real-handed ergonomics are unverified.
-8. **`BYE` on exit** is best-effort and is not part of the gesture vocabulary;
-   the relay echoes `EVT BYE` and nothing else happens (harmless).
+7. **Timing / tuning values.** The double-tap window is 250 ms (this is also the
+   deferral latency added to every single tap); scroll auto-repeat uses a 500 ms
+   initial grace, 100 ms period. All are chosen for feel and are safe to tune in
+   `g2_controller.c`; real-handed ergonomics are unverified.
+8. **`BYE` on exit** is a recognised token: the relay logs it and does nothing
+   else (no `EVT` echo, no render). It is a farewell, not a gesture.
