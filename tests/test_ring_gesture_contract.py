@@ -124,8 +124,27 @@ def main():
     # must be staged on every gesture emission (not left at the 33-byte max).
     check("g2_ring_out_len = G2_REPORT_LEN" in src,
           "notification length is staged on every gesture emission")
-    # CCCD 0x2902 present for the notify chars
-    check(src.count("0x2902") >= 1, "0x2902 CCCD descriptor is declared")
+    # Notify chars must NOT declare an explicit 0x2902 CCCD.
+    # The STM32WB radio auto-allocates the CCCD for a notify/indicate char when
+    # it is added; every shipped service (ble_svc_serial_chars / ble_svc_battery_
+    # chars, decoded from .rodata) passes descriptor_params = NULL, and no
+    # BleGattCharacteristicDescriptorParams with uuid 0x2902 exists anywhere in
+    # firmware.elf. Declaring our own was actively harmful: on hardware,
+    # ble_gatt_characteristic_init takes the descriptor branch when
+    # descriptor_params != NULL and calls the descriptor's data_callback.fn --
+    # which we left NULL -- and the Flipper took a MemManage fault. So every
+    # characteristic must pass NULL as its descriptor. This assertion used to
+    # demand the opposite; it now contradicts the header/radio instead of the code.
+    fill_calls = re.findall(r"g2_ring_fill_char\(&(.*?)\);", src, re.S)
+    notify_calls = [c for c in fill_calls if "p_notify" in c]
+    check(len(notify_calls) == 2,
+          "both notify characteristics are configured through g2_ring_fill_char")
+    check(all(c.rstrip().endswith("NULL") for c in fill_calls),
+          "every characteristic passes descriptor_params = NULL (no explicit 0x2902 CCCD)")
+    check("uuid.Char_UUID_16 = 0x2902" not in src,
+          "no explicit 0x2902 CCCD descriptor is declared")
+    check("BleGattCharacteristicDescriptorParams d_cccd" not in src,
+          "no explicit CCCD descriptor members remain in the profile struct")
 
     # ---- 5. the min-report-gap guard (>=100 ms) --------------------------
     check(re.search(r"#define\s+G2_MIN_REPORT_GAP_MS\s+100\b", src) is not None,

@@ -55,6 +55,32 @@
  *  own lock) and post custom events through the view dispatcher. All
  *  ble_gatt_characteristic_update() calls happen on the GUI thread. Shared
  *  non-model state (the profile pointer, the report gap timer) is mutex-guarded.
+ *
+ * ===========================================================================
+ *  API PARAMETERS -- matched against the SHIPPED services, decoded from the
+ *  stock firmware.elf, never invented:
+ * ===========================================================================
+ *  ble_gatt_service_add(UUID_TYPE_128BIT, &su, PRIMARY_SERVICE=0x01, 12, &h)
+ *    - Service_Type must be PRIMARY_SERVICE (0x01). 0x00 is not a defined type;
+ *      aci_gatt_add_service forwards the byte to the coprocessor verbatim, and
+ *      ble_svc_serial_start / ble_svc_battery_start both pass 0x01.
+ *    - Max_Attribute_Records = 12: the value ble_svc_serial_start uses for its
+ *      own four-characteristic 128-bit PRIMARY service (battery uses 8). 20 was
+ *      over-sized for a finite, shared GATT attribute table.
+ *    - Characteristics declare NO descriptor: every shipped notify char passes
+ *      descriptor_params = NULL and the STM32WB auto-allocates the 0x2902 CCCD.
+ *      No 0x2902 descriptor exists anywhere in firmware.elf.
+ *    - security_permissions = ATTR_PERMISSION_NONE (0x00), a value that IS
+ *      defined in ble_defs.h, so it is left as-is.
+ *
+ * ===========================================================================
+ *  STACK FOOTPRINT -- the BLE-callback and profile-start paths run on threads
+ *  with small stacks, and a MemManage fault on this Cortex-M host is the
+ *  classic stack-overflow signature. Every large local on those paths
+ *  (Service_UUID_t, and the hex/line/diag/name format buffers) is therefore
+ *  static rather than stack. Every snprintf is bounded by the sizeof of its
+ *  destination.
+ * ===========================================================================
  */
 
 #include <furi.h>
@@ -218,8 +244,6 @@ typedef struct {
     BleGattCharacteristicParams p_notify_legacy;
     BleGattCharacteristicParams p_write_health;
     BleGattCharacteristicParams p_notify_health;
-    BleGattCharacteristicDescriptorParams d_cccd_legacy;
-    BleGattCharacteristicDescriptorParams d_cccd_health;
 
     BleGattCharacteristicInstance ch_write_legacy;
     BleGattCharacteristicInstance ch_notify_legacy;
@@ -432,8 +456,11 @@ static void g2_ring_tap_timer_callback(void* context) {
 static void
     g2_ring_handle_write(G2RingApp* app, G2RingProfile* profile, uint16_t handle,
                          const uint8_t* val, size_t vlen) {
-    char hex[27]; /* up to 12 bytes -> 24 chars + NUL */
-    char line[64];
+    /* Static scratch: this runs on the BLE stack's callback path, whose thread
+     * stack is small; a MemManage there is the classic overflow signature. The BLE
+     * path is single-threaded, so one shared buffer set is safe. */
+    static char hex[27]; /* up to 12 bytes -> 24 chars + NUL */
+    static char line[64];
     hexify(hex, sizeof(hex), val, vlen > 12 ? 12 : vlen);
 
     /* (a) Enabling the CCCD on the notify/legacy char (bae80011) means this
@@ -502,9 +529,9 @@ static void g2_ring_on_ble_event(G2RingApp* app, G2RingProfile* profile, const u
     /* Always log the raw frame so a hardware run is diagnosable even if the
      * interpretive parse below turns out to be wrong. */
     {
-        char hex[27]; /* up to 13 bytes -> 26 chars + NUL */
+        static char hex[27]; /* up to 13 bytes -> 26 chars + NUL */
         hexify(hex, sizeof(hex), pkt, total > 13 ? 13 : total);
-        char line[64];
+        static char line[64];
         snprintf(line, sizeof(line), "< t%02X %s", type, hex);
         g2_ring_log(app, line);
     }
@@ -574,34 +601,47 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
     profile->app = app;
 
     bool svc_ok = true;
-    Service_UUID_t su;
+    /* Static, NOT a stack local: keep large locals off the (small) BT-service
+     * thread stack -- a MemManage on this host is the classic stack-overflow
+     * signature. See the STACK FOOTPRINT note at the top of this file. */
+    static Service_UUID_t su;
     memset(&su, 0, sizeof(su));
     memcpy(su.Service_UUID_128, r1_uuid_service, sizeof(r1_uuid_service));
     /* Service_Type = GATT_SERVICE_PRIMARY (0x01). The previous build passed
      * 0x00, which is not a defined Service_Type and made the coprocessor reject
      * the whole service add. */
+    /* Max_Attribute_Records = 12, matching ble_svc_serial_start EXACTLY: the
+     * shipped serial service also declares a 128-bit PRIMARY service with four
+     * characteristics and passes 12 (disassembly: movs r2,#1 [Service_Type];
+     * movs r3,#12 [Max_Attribute_Records] before the call). 20 was over-sized:
+     * the STM32WB GATT server's attribute table is a finite shared resource, and
+     * 20 records exceeds what any shipped service requests (serial=12, battery=8)
+     * and what this four-characteristic service needs, so it was a needless
+     * failure/overrun mode. See the API PARAMETERS note at the top of this file. */
     bool svc_add_ok = ble_gatt_service_add(
-        UUID_TYPE_128BIT, &su, GATT_SERVICE_PRIMARY, 20, &profile->svc_handle);
+        UUID_TYPE_128BIT, &su, GATT_SERVICE_PRIMARY, 12, &profile->svc_handle);
     if(!svc_add_ok) {
         FURI_LOG_E(TAG, "ble_gatt_service_add failed");
         svc_ok = false;
     }
 
-    /* 0x2902 Client Characteristic Configuration descriptor for each notify. */
-    memset(&profile->d_cccd_legacy, 0, sizeof(profile->d_cccd_legacy));
-    profile->d_cccd_legacy.uuid_type = UUID_TYPE_16BIT;
-    profile->d_cccd_legacy.uuid.Char_UUID_16 = 0x2902;
-    profile->d_cccd_legacy.max_length = 2;
-    profile->d_cccd_legacy.security_permissions = 0x00;
-    profile->d_cccd_legacy.access_permissions = ATTR_ACCESS_READ_WRITE;
-    profile->d_cccd_legacy.gatt_evt_mask = 0x00;
-    profile->d_cccd_legacy.is_variable = 0;
-    profile->d_cccd_health = profile->d_cccd_legacy;
-
+    /* NO explicit 0x2902 CCCD on any characteristic -- descriptor_params = NULL
+     * on all four, exactly like every shipped service.
+     *
+     * EVIDENCE: (1) no BleGattCharacteristicDescriptorParams with uuid 0x2902
+     * exists anywhere in firmware.elf (a grep of the whole binary for 0x2902 /
+     * "Client Characteristic" returns nothing); (2) ble_svc_serial_chars and
+     * ble_svc_battery_chars, decoded from .rodata, have descriptor_params (their
+     * +4 word) == 0 for EVERY characteristic. The STM32WB radio auto-allocates the
+     * CCCD for a notify/indicate characteristic when it is added, so declaring our
+     * own is both redundant and harmful: ble_gatt_characteristic_init takes the
+     * descriptor branch when descriptor_params != NULL and calls the descriptor's
+     * data_callback.fn unconditionally, which we left NULL -- that indirect call
+     * is the MemManage fault we hit on hardware. NULL skips that branch entirely. */
     g2_ring_fill_char(&profile->p_write_legacy, "r1_write_legacy", r1_uuid_write_legacy, GATT_PROP_WRITE_ANY, NULL);
-    g2_ring_fill_char(&profile->p_notify_legacy, "r1_notify_legacy", r1_uuid_notify_legacy, GATT_PROP_NOTIFY, &profile->d_cccd_legacy);
+    g2_ring_fill_char(&profile->p_notify_legacy, "r1_notify_legacy", r1_uuid_notify_legacy, GATT_PROP_NOTIFY, NULL);
     g2_ring_fill_char(&profile->p_write_health, "r1_write_health", r1_uuid_write_health, GATT_PROP_WRITE_ANY, NULL);
-    g2_ring_fill_char(&profile->p_notify_health, "r1_notify_health", r1_uuid_notify_health, GATT_PROP_NOTIFY, &profile->d_cccd_health);
+    g2_ring_fill_char(&profile->p_notify_health, "r1_notify_health", r1_uuid_notify_health, GATT_PROP_NOTIFY, NULL);
 
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_write_legacy, &profile->ch_write_legacy);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_notify_legacy, &profile->ch_notify_legacy);
@@ -630,7 +670,8 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
      * refused instead of a single boolean. A zero handle marks the specific
      * characteristic/descriptor that failed. */
     if(app) {
-        char diag[LOG_LINE_LEN];
+        /* Static scratch: this runs on the profile-start path (small stack). */
+        static char diag[LOG_LINE_LEN];
         snprintf(diag, sizeof(diag), "svcAdd=%d h=%u", (int)svc_add_ok, profile->svc_handle);
         g2_ring_log(app, diag);
         snprintf(
@@ -698,7 +739,7 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
     memcpy(cfg->adv_service.Service_UUID_128, r1_uuid_service, sizeof(r1_uuid_service));
 
     const uint8_t* mac = furi_hal_version_get_ble_mac();
-    char name[FURI_HAL_VERSION_DEVICE_NAME_LENGTH];
+    static char name[FURI_HAL_VERSION_DEVICE_NAME_LENGTH];
     snprintf(name, sizeof(name), "EVEN R1_%02X%02X%02X", mac[2], mac[1], mac[0]);
     strncpy(cfg->adv_name, name, sizeof(cfg->adv_name) - 1);
     cfg->adv_name[sizeof(cfg->adv_name) - 1] = '\0';
