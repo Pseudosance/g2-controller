@@ -1,3 +1,47 @@
+// g2_controller -- Even G2 button remote for the Flipper Zero.
+//
+// Topology:  Flipper Zero (BLE *peripheral*, Serial GATT profile)
+//                -> relay/g2_relay.py (BLE *central*, owns the G2 link)
+//                -> Even G2 glasses (EUS over BLE).
+//
+// Pad presses become short, newline-terminated ASCII command lines that the
+// relay parses in Relay.on_flipper_line().
+//
+// ===========================================================================
+//  WIRE VOCABULARY  --  gesture to exact line emitted   *** EDIT THIS TABLE ***
+// ===========================================================================
+//  The relay keeps only the FIRST whitespace-delimited token of each '\n'-
+//  terminated line and upper-cases it; anything after that token is ignored.
+//  So we emit ONE bare token per line and send NO numeric argument (send
+//  "SCROLL_UP", not "SCROLL_UP 3"). Keep these strings identical to
+//  relay/g2_relay.py:Relay.on_flipper_line() or the buttons go dead.
+//
+//  Gesture            Emitted line    Relay action
+//  ----------------   -------------   --------------------------------------
+//  UP tap             SCROLL_UP       move menu selection up
+//  UP held            SCROLL_UP (xN)  continuous scroll up (auto-repeat)
+//  DOWN tap           SCROLL_DOWN     move menu selection down
+//  DOWN held          SCROLL_DOWN(xN) continuous scroll down (auto-repeat)
+//  OK short           TAP             activate the selected item
+//  OK double-tap      DOUBLE_TAP      quick status ping (G2 fetch)
+//  OK long press      LONG_TAP        status ping
+//  LEFT tap           NAV_BACK        previous page
+//  RIGHT tap          NAV_HOME        next page
+//  LEFT long press    STATUS          status ping (explicit request)
+//  BACK               (none)          exit the app
+//  ping timer         PING            keepalive; relay answers PONG
+//  app exit           BYE             best-effort farewell (not a gesture)
+// ===========================================================================
+#define CMD_SCROLL_UP   "SCROLL_UP"
+#define CMD_SCROLL_DOWN "SCROLL_DOWN"
+#define CMD_TAP         "TAP"
+#define CMD_DOUBLE_TAP  "DOUBLE_TAP"
+#define CMD_LONG_TAP    "LONG_TAP"
+#define CMD_NAV_BACK    "NAV_BACK"
+#define CMD_NAV_HOME    "NAV_HOME"
+#define CMD_STATUS      "STATUS"
+#define CMD_PING        "PING"
+
 #include <furi.h>
 #include <furi_hal.h>
 
@@ -21,6 +65,16 @@
 #define RELAY_TIMEOUT_MS 7000
 #define LINE_MAX 64
 
+// Two OK short-releases closer together than this count as a double-tap.
+#define DOUBLE_TAP_MS 300
+// Held-key auto-repeat: after a press we wait this long before starting to
+// repeat (a normal tap releases sooner, so a tap still sends exactly ONE
+// command), then repeat every SCROLL_REPEAT_PERIOD_MS. Chosen so a deliberate
+// tap (<500 ms) never double-fires, while a hold scrolls smoothly at ~10 Hz
+// without flooding the BLE link.
+#define SCROLL_REPEAT_DELAY_MS 500
+#define SCROLL_REPEAT_PERIOD_MS 100
+
 typedef struct {
     Gui* gui;
     ViewDispatcher* view_dispatcher;
@@ -32,10 +86,21 @@ typedef struct {
     bool central_connected; // PC/smartphone connected to Flipper over BLE
 
     FuriTimer* ping_timer;
+    FuriTimer* scroll_timer; // our own held-key auto-repeat timer
     uint32_t last_pong_ms;
     bool relay_up;
     bool glasses_up;
     bool running;
+
+    // Double-tap detection: a DEDICATED previous OK release stamp. It is never
+    // shared with the press path (reusing one last-press variable is what
+    // produces false double-taps).
+    uint32_t ok_prev_release_ms;
+    bool ok_have_prev_release;
+
+    // Held-key scroll repeat state.
+    InputKey scroll_key; // which key is repeating, or InputKeyMAX for none
+    uint32_t scroll_press_ms;
 
     char rx_line[LINE_MAX];
     size_t rx_len;
@@ -81,6 +146,45 @@ static void g2_tx(G2App* app, const char* line) {
         notification_message(app->notifications, &sequence_blink_blue_10);
     } else {
         notification_message(app->notifications, &sequence_blink_red_10);
+    }
+}
+
+// ---- held-key auto-repeat (our own timer) --------------------------------
+static void g2_scroll_timer_callback(void* context) {
+    G2App* app = context;
+    if(app->scroll_key == InputKeyMAX) return;
+    // Tap grace: skip repeats until the key has been held past SCROLL_REPEAT_DELAY_MS.
+    if((g2_now_ms() - app->scroll_press_ms) < SCROLL_REPEAT_DELAY_MS) return;
+    if(app->scroll_key == InputKeyUp) {
+        g2_tx(app, CMD_SCROLL_UP);
+    } else if(app->scroll_key == InputKeyDown) {
+        g2_tx(app, CMD_SCROLL_DOWN);
+    }
+}
+
+static void g2_scroll_begin(G2App* app, InputKey key, const char* cmd) {
+    app->scroll_key = key;
+    app->scroll_press_ms = g2_now_ms();
+    g2_tx(app, cmd); // immediate: a quick tap sends exactly one command
+    furi_timer_stop(app->scroll_timer);
+    furi_timer_start(app->scroll_timer, furi_ms_to_ticks(SCROLL_REPEAT_PERIOD_MS));
+}
+
+static void g2_scroll_end(G2App* app) {
+    furi_timer_stop(app->scroll_timer);
+    app->scroll_key = InputKeyMAX;
+}
+
+// ---- OK short: single vs double tap from release timing ------------------
+static void g2_ok_short(G2App* app) {
+    uint32_t now = g2_now_ms();
+    if(app->ok_have_prev_release && (now - app->ok_prev_release_ms) <= DOUBLE_TAP_MS) {
+        g2_tx(app, CMD_DOUBLE_TAP);
+        app->ok_have_prev_release = false; // consume the pair
+    } else {
+        g2_tx(app, CMD_TAP);
+        app->ok_prev_release_ms = now; // arm the window for a possible 2nd tap
+        app->ok_have_prev_release = true;
     }
 }
 
@@ -154,6 +258,7 @@ static void g2_bt_status_callback(BtStatus status, void* context) {
     if(!app->central_connected) {
         app->relay_up = false;
         app->rx_len = 0;
+        g2_scroll_end(app);
     }
     with_view_model(
         app->view, G2Model * model, { model->relay_up = app->relay_up; }, true);
@@ -166,7 +271,7 @@ static void g2_ping_timer_callback(void* context) {
 
     if(app->central_connected) {
         char buf[8];
-        int n = snprintf(buf, sizeof(buf), "PING\n");
+        int n = snprintf(buf, sizeof(buf), "%s\n", CMD_PING);
         ble_profile_serial_tx(app->serial_profile, (uint8_t*)buf, (uint16_t)n);
     }
 
@@ -199,31 +304,45 @@ static void g2_draw_callback(Canvas* canvas, void* ctx) {
                     model->glasses_up ? "Glasses: linked" : "Glasses: not linked");
     canvas_draw_line(canvas, 2, 32, 126, 32);
     canvas_draw_str(canvas, 4, 35, model->page[0] ? model->page : "no page shown");
-    canvas_draw_str(canvas, 4, 45, model->info[0] ? model->info : "U/D page  R list");
+    canvas_draw_str(canvas, 4, 45, model->info[0] ? model->info : "U/D scroll  L/R page");
     canvas_draw_str(canvas, 4, 55,
-                    model->evt[0] ? model->evt : "OK send  OK-hold status");
+                    model->evt[0] ? model->evt : "OK tap  2x/L-hold stat");
 }
 
 static bool g2_input_callback(InputEvent* event, void* context) {
     G2App* app = context;
 
-    if(event->type == InputTypeLong && event->key == InputKeyOk) {
-        g2_tx(app, "STATUS");
-        return true;
-    }
-    if(event->type == InputTypeShort || event->type == InputTypeRepeat) {
-        switch(event->key) {
-        case InputKeyUp:
-            g2_tx(app, "PAGE prev");
+    switch(event->type) {
+    case InputTypePress:
+        // UP/DOWN: emit one immediately and start our own auto-repeat timer.
+        if(event->key == InputKeyUp) {
+            g2_scroll_begin(app, InputKeyUp, CMD_SCROLL_UP);
             return true;
-        case InputKeyDown:
-            g2_tx(app, "PAGE next");
+        }
+        if(event->key == InputKeyDown) {
+            g2_scroll_begin(app, InputKeyDown, CMD_SCROLL_DOWN);
+            return true;
+        }
+        break;
+
+    case InputTypeRelease:
+        if((event->key == InputKeyUp || event->key == InputKeyDown) &&
+           event->key == app->scroll_key) {
+            g2_scroll_end(app);
+            return true;
+        }
+        break;
+
+    case InputTypeShort:
+        switch(event->key) {
+        case InputKeyOk:
+            g2_ok_short(app);
+            return true;
+        case InputKeyLeft:
+            g2_tx(app, CMD_NAV_BACK);
             return true;
         case InputKeyRight:
-            g2_tx(app, "LIST");
-            return true;
-        case InputKeyOk:
-            g2_tx(app, "SHOW");
+            g2_tx(app, CMD_NAV_HOME);
             return true;
         case InputKeyBack:
             // fall through to view_dispatcher exit
@@ -231,6 +350,23 @@ static bool g2_input_callback(InputEvent* event, void* context) {
         default:
             break;
         }
+        break;
+
+    case InputTypeLong:
+        switch(event->key) {
+        case InputKeyOk:
+            g2_tx(app, CMD_LONG_TAP);
+            return true;
+        case InputKeyLeft:
+            g2_tx(app, CMD_STATUS);
+            return true;
+        default:
+            break;
+        }
+        break;
+
+    default:
+        break;
     }
     return false;
 }
@@ -275,9 +411,12 @@ int32_t g2_controller_main(void* p) {
     }
 
     app->running = true;
+    app->scroll_key = InputKeyMAX;
     app->ping_timer =
         furi_timer_alloc(g2_ping_timer_callback, FuriTimerTypePeriodic, app);
     furi_timer_start(app->ping_timer, furi_ms_to_ticks(PING_PERIOD_MS));
+    app->scroll_timer =
+        furi_timer_alloc(g2_scroll_timer_callback, FuriTimerTypePeriodic, app);
     app->last_pong_ms = g2_now_ms();
 
     view_dispatcher_run(app->view_dispatcher);
@@ -285,6 +424,8 @@ int32_t g2_controller_main(void* p) {
     app->running = false;
     furi_timer_stop(app->ping_timer);
     furi_timer_free(app->ping_timer);
+    furi_timer_stop(app->scroll_timer);
+    furi_timer_free(app->scroll_timer);
 
     // Say bye (best effort), then hand BLE back to the default profile.
     g2_tx(app, "BYE");

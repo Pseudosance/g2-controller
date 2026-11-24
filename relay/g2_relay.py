@@ -251,7 +251,7 @@ class Relay:
                     await self.g2.show_list(self.list_name, items)
                     self.say(f"PAGE menu {self.sel + 1}/{len(self.menu)}")
                 elif name == "status":
-                    st = self.g2.status or await self.g2.status() or {}
+                    st = self.g2.status or await self.g2.fetch_status() or {}
                     body = ("Even G2" + chr(10) + chr(10) +
                             f"battery: {st.get('battery', '?')}%" +
                             ("  charging" if st.get("charging") else "") + chr(10) +
@@ -293,7 +293,7 @@ class Relay:
         elif cmd == "TAP":
             asyncio.ensure_future(self.activate())
             return
-        elif cmd in ("DOUBLE_TAP", "STATUS"):
+        elif cmd in ("DOUBLE_TAP", "LONG_TAP", "STATUS"):
             asyncio.ensure_future(self._g2_status_ping())
         else:
             self.say("EVT " + cmd)
