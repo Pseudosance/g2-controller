@@ -1,156 +1,231 @@
-# G2 Controller — Dual Implementation
+# g2-controller — drive Even Realities G2 glasses from a Flipper Zero
 
-Control Even Realities G2 glasses without the R1 ring.
+Goal: let Mitchell drive the Even Realities G2 glasses' on-screen content with
+Flipper Zero buttons instead of the Even **R1 ring**. The gestures to reproduce
+are the ones the R1 emits: scroll up, scroll down, tap, double tap, and hold.
 
-## Project Structure
-
-```
-g2-controller/
-├── android/           # Android app (Kotlin + Compose + BLE)
-│   └── app/
-└── flipper/           # Flipper Zero app (C, builds to .fap)
-    └── apps/g2_controller/
-```
+Two things exist and two do not. Read "The hard blocker" first — it decides which
+architecture below is reachable from a stock Flipper.
 
 ---
 
-## Android App
+## THE HARD BLOCKER (read before anything else)
 
-**Target:** Old Android phone (API 26+), one-handed thumb-zone UI
+A stock Flipper `.fap` **cannot** talk to the glasses directly:
 
-### Build
+1. **A stock fap cannot be a BLE central.** It cannot scan for, connect out to, or
+   discover services on the G2 — no GATT-client API is exported to apps. Flipper
+   apps are BLE *peripherals* only.
+2. **The BLE HID profile is DISABLED.** The `ble_profile_hid*` symbols exist in the
+   SDK header but are marked DISABLED in the firmware API and are absent from
+   `firmware.elf`, so `ufbt` hard-fails any build that uses them. The Flipper
+   cannot emulate a keyboard. See `flipper/BLE_HID_BLOCKER.md` for the evidence.
+3. **The Even app ignores external keyboard input.** So even a keyboard emulator
+   would not drive the glasses.
 
-```bash
-cd android
-./gradlew assembleDebug
-# Output: app/build/outputs/apk/debug/app-debug.apk
-```
-
-### Install
-
-```bash
-adb install app/build/outputs/apk/debug/app-debug.apk
-```
-
-### Use
-
-1. Open app → "Scan for G2"
-2. Put G2 in pairing mode (hold button 3s)
-3. Select G2 from list
-4. Controls appear — large buttons at bottom for thumb:
-   - **Scroll ↑ / ↓** — scroll content
-   - **Tap / Long Tap / 2× Tap** — click variants
-   - **Back / Home** — navigation
-5. App runs in foreground service (persistent notification) — survives screen-off
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `ble/EusPackets.kt` | EUS protocol framing (ported from even-g2-js) |
-| `ble/EusClient.kt` | Low-level GATT client |
-| `ble/BleManager.kt` | Scan, connect, reconnect, state |
-| `service/G2ControllerService.kt` | Foreground service |
-| `ui/ControllerScreen.kt` | One-handed Compose UI |
-| `ui/ControllerViewModel.kt` | State + commands |
-
-### Protocol Reference
-
-EUS Service: `00002760-08c2-11e1-9073-0e8ac72e5450`
-- TX (write): `00002760-08c2-11e1-9073-0e8ac72e5401`
-- RX (notify): `00002760-08c2-11e1-9073-0e8ac72e5402`
-
-Commands implemented:
-- `0x20` Scroll (payload: direction + lines)
-- `0x21` Tap
-- `0x22` Long tap
-- `0x23` Double tap
-- `0x24` Nav back
-- `0x25` Nav home
+Consequence: the Flipper cannot connect out to the glasses, and cannot type into
+the phone's Even app. Any design that needs the Flipper to be a BLE central or a
+keyboard is dead. Do not rediscover this.
 
 ---
 
-## Flipper Zero App
+## What works: the RELAY (offline-validated)
 
-**Target:** Flipper Zero (any firmware), physical 5-way button control
+The one working architecture keeps the Flipper a peripheral and puts the BLE
+central role on a PC:
 
-### Build (with ufbt)
+    Flipper Zero (BLE peripheral, Serial GATT, advertises "G2Ctrl")
+        --BLE serial--> relay daemon (bleak) --BLE(EUS)--> Even G2 glasses
 
-```bash
-# Option 1: In flipperzero-firmware repo
-cp -r flipper/apps/g2_controller /path/to/flipperzero-firmware/applications_user/
-cd /path/to/flipperzero-firmware
-./fbt fap_g2_controller
+`relay/g2_relay.py` is a single process that is a BLE **central to both** devices:
+it connects to the Flipper's Serial GATT service (text lines) and to the glasses'
+EUS service (framed protobuf), and moves events between them. It runs on Windows
+(bleak WinRT backend) or Linux (BlueZ).
 
-# Option 2: Standalone with ufbt
-cd flipper/apps/g2_controller
-ufbt
-# Output: dist/g2_controller.fap
-```
+### Line protocol (Flipper <-> relay, newline-terminated ASCII)
 
-### Install
+Flipper -> relay, one bare token per line:
 
-1. Copy `g2_controller.fap` to Flipper SD card: `SD:/apps/g2_controller.fap`
-2. On Flipper: Main Menu → Apps → G2 Controller
+    TAP | DOUBLE_TAP | LONG_TAP | SCROLL_UP | SCROLL_DOWN | NAV_BACK | NAV_HOME | STATUS | PING | BYE
 
-### Use
+relay -> Flipper:
 
-| Button | Action |
-|--------|--------|
-| **UP** | Scroll up |
-| **DOWN** | Scroll down |
-| **OK (short)** | Tap |
-| **OK (hold 1s)** | Long tap |
-| **OK (double-click)** | Double tap |
-| **LEFT** | Nav back |
-| **RIGHT** | Nav home |
-| **BACK** | Exit app |
+    HELLO <ver> | PONG | LINK 0|1 | PAGE <desc> | INFO <text>
 
-**No firmware flashing** — just a `.fap` file on SD card. Delete anytime.
+The relay reads only the first whitespace-delimited token of each line and
+upper-cases it; anything after it is ignored, so the app sends one bare token per
+line and no argument. **An unrecognised token is echoed back to the Flipper as
+`EVT <TOKEN>` and does nothing else** (`Relay.on_flipper_line`). `PING` and `BYE`
+are recognised explicitly, so they are not echoed.
 
-### Key Files
+### Framing (the real protocol — not the fiction)
 
-| File | Purpose |
-|------|---------|
-| `application.fam` | App manifest |
-| `g2_controller.c` | Main app (BLE + input + UI) |
-| `CMakeLists.txt` | Build config |
+The framing the relay speaks, and the one the golden tests pin, is:
 
----
+    MAGIC (aa 21) | seq u8 | len u8 | total u8 | index u8 | sid u8 | flag u8 | payload + crc16
 
-## EUS Protocol Notes
+The CRC is CRC-16/CCITT-FALSE over the whole payload, appended payload-internal,
+little-endian. Strings are UTF-8; ack replies echo the request magic in protobuf
+field 2. This is implemented in `relay/g2proto.py` — a faithful port of the
+vendored `vendor/even-g2-js/g2.js` — and validated byte-for-byte by
+`tests/test_g2proto_golden.py`.
 
-Frame format (from reverse engineering):
-```
-[FLAG:1][LEN_HI:1][LEN_LO:1][CMD:1][PAYLOAD:N][CHECKSUM:1]
-Checksum = XOR of all preceding bytes
-```
+### EUS service/characteristic UUIDs (from relay/g2proto.py, matching g2.js)
 
-Known commands (from `mrahtz/even-g2-js` and `aluminumio/even`):
-- `0x01` Ping
-- `0x02` Auth (challenge-response)
-- `0x10` Display text
-- `0x11` Display image
-- `0x12` Clear
-- `0x20` Scroll (dir: 0=up, 1=down; lines)
-- `0x21` Tap
-- `0x22` Long tap
-- `0x23` Double tap
-- `0x24` Nav back
-- `0x25` Nav home
+    service candidates: 00002760-08c2-11e1-9073-0e8ac72e{0000,5450,6450,7450}
+    write:              00002760-08c2-11e1-9073-0e8ac72e5401
+    notify:             00002760-08c2-11e1-9073-0e8ac72e5402
 
 ---
 
-## Next Steps
+## The Flipper app (flipper/apps/g2_controller/g2_controller.c)
 
-1. **Android:** Fill in `EusClient.write()` queue processor, test with real G2
-2. **Flipper:** Complete BLE service discovery + characteristic handles
-3. **Both:** Implement auth handshake if G2 requires it (check `even-g2-js` for current flow)
+Emits the relay's command vocabulary from pad presses. Gesture -> emitted token:
+
+| Gesture          | Token           | Relay action                       |
+|------------------|-----------------|------------------------------------|
+| UP tap           | SCROLL_UP       | menu selection up                  |
+| UP hold          | SCROLL_UP (xN)  | held-key auto-repeat               |
+| DOWN tap         | SCROLL_DOWN     | menu selection down                |
+| DOWN hold        | SCROLL_DOWN (xN)| held-key auto-repeat               |
+| OK short         | TAP (deferred)  | activate the highlighted item      |
+| OK double-tap    | DOUBLE_TAP      | status ping                        |
+| OK long press    | LONG_TAP        | status ping                        |
+| LEFT short       | NAV_BACK        | previous page                      |
+| RIGHT short      | NAV_HOME        | next page                          |
+| LEFT long        | STATUS          | status ping                        |
+| BACK             | (none)          | exit the app                       |
+| ping timer (2 s) | PING            | keepalive; relay answers PONG      |
+| app exit         | BYE             | farewell (logged, not a gesture)   |
+
+**Deferred single tap.** A lone OK release does NOT emit `TAP` immediately. The
+first release only arms a one-shot window of `DOUBLE_TAP_WINDOW_MS` (250 ms);
+`TAP` is emitted only if that window expires with no second press. A second OK
+release inside the window becomes `DOUBLE_TAP` and NO `TAP` is emitted. So **a
+double-tap deliberately does not also activate the highlighted item** — the menu
+contains Clear and Re-link, where a stray `TAP` would wipe the display or tear
+down the glasses session. Cost: every single tap is delayed by up to 250 ms; that
+window is the one tap-feel knob. A tap still pending at app exit is dropped.
+
+Held UP/DOWN use the app's own auto-repeat timer: one command on press, then a
+500 ms grace before repeating every 100 ms (so a quick tap sends exactly one
+command). This is separate from the firmware's own long-press timing.
 
 ---
 
-## References
+## Current direction — NOT YET IMPLEMENTED
 
-- `mrahtz/even-g2-js` — Web Bluetooth reference implementation
-- `aluminumio/even` — Swift implementation (UUID source)
-- `jimrandomh/faceclaw` — Unofficial Android app (protocol details)
+Idea: the Even **R1 ring is itself a BLE peripheral**, and the glasses are the BLE
+**centrals** that connect *to* it. If the Flipper could advertise the ring's GATT
+service and reproduce its characteristic behaviour, the glasses would accept the
+Flipper as if it were the ring — no PC relay needed for the ring-gesture path.
+
+The ring's vendor service and characteristic pairs the plan targets (not
+referenced by any code in this repository; treated as the plan, unverified):
+
+    vendor service:        bae80001-4f05-4503-8e65-3af1f7329d1f
+    characteristic pair:   bae80010 / bae80011
+    characteristic pair:   bae80012 / bae80013
+
+**Status: unbuilt.** It is gated on whether a **stock `.fap` can host a
+custom-UUID GATT service** at all. The only GATT API exported to apps is
+server-side (`ble_gatt_*` / `ble_event_dispatcher_*`); whether an app can register
+an arbitrary 128-bit service, and whether the glasses would trust an unbound
+stand-in ring, is unproven. Nothing here is implemented.
+
+---
+
+## Build and test
+
+### Flipper app (.fap)
+
+Build with `ufbt` from the app directory:
+
+    cd flipper/apps/g2_controller && ufbt
+
+Output: `flipper/apps/g2_controller/dist/g2_controller.fap`
+
+(on this machine `ufbt` is `/home/CachedOut/.local/bin/ufbt`). Install by copying
+that file — via **qFlipper**; the Flipper has no USB mass-storage mode — to
+`apps/g2_controller.fap` on the SD card. No firmware flashing.
+
+### Tests
+
+Run all three from the repo root with `python3` (verified with Python 3.14.9):
+
+    python3 tests/test_g2proto_golden.py    # g2proto must match g2.js byte-for-byte
+    python3 tests/test_relay_offline.py     # relay end-to-end vs an in-memory fake G2
+    python3 tests/test_wire_contract.py     # C tokens == relay grammar, both directions
+
+`test_g2proto_golden.py` additionally needs `node` on PATH (verified with
+v26.12.1). All three pass with no BLE and no hardware.
+
+---
+
+## Repository map
+
+**Real / authoritative**
+- `relay/g2proto.py` — the EUS protocol layer (framing, CRC, protobuf, handshake,
+  events). Port of the vendored `g2.js`; golden-tested. This is the contract.
+- `relay/g2_relay.py` — the relay daemon (central to both Flipper and glasses;
+  line protocol; render loop).
+- `flipper/apps/g2_controller/` — the Flipper app; emits the relay's tokens.
+- `tests/` — golden (vs g2.js), offline relay, and wire-contract tests.
+- `flipper/HARDWARE-CHECKLIST.md` — physical bring-up procedure.
+- `flipper/BLE_HID_BLOCKER.md` — evidence for the hard blocker.
+
+**Reference (read-only, not our code)**
+- `vendor/even-g2-js/g2.js` — vendored Web Bluetooth reference; `g2proto.py`
+  mirrors it. Its own header notes the protocol is unofficial and community
+  reverse-engineered.
+
+**Experimental**
+- The R1-ring impersonation plan above — no code exists.
+
+**Dead / do not reuse**
+- `android/_wip/` — SUPERSEDED first-generation Android relay. Its protocol layer
+  (`EusPackets.kt`) uses a FABRICATED frame and fabricated commands. Do not reuse;
+  see its own README.
+- `flipper/attic/` — earlier hallucinated work (a "wrong" Flipper app that invents
+  a BLE-central flow, HID, a fake frame and auth handshake; a "wrong" manifest; a
+  `.hallucinated` relay). Do not reuse.
+
+Earlier documents described a fabricated protocol — a raw
+`[FLAGS][LEN_HI][LEN_LO][CMD][PAYLOAD][XOR checksum]` frame with byte commands
+`0x01 PING`, `0x20 SCROLL`, `0x21 TAP`, `0x22 LONG_TAP`, `0x23 DOUBLE_TAP`,
+`0x24 NAV_BACK`, `0x25 NAV_HOME` and a `0x02 AUTH` challenge. **None of that
+exists.** If you find it again anywhere in this project, it is the same
+hallucination, not a spec.
+
+---
+
+## KNOWN UNKNOWNS (confirmable only on real hardware)
+
+Nothing below has been verified against a physical G2 or Flipper.
+
+1. **Relay -> glasses handshake and prelude payloads.** The 7 `sid=0x80` start-up
+   messages and the verbatim `sid=0x01` launch prelude in `relay/g2proto.py` are
+   byte-faithful to `g2.js` (golden-tested), but a real G2's *acceptance* of them
+   is unverified — no BLE sniff has been captured.
+2. **sid / magic matching.** `EUSLink.feed` matches a reply to a pending request by
+   magic, with a fallback ("complete the oldest waiter on that sid") for
+   settings/status replies that carry data in protobuf field 2. That fallback is
+   safe only while requests are sequential; verify with a sniff.
+3. **Auth challenge.** It is unknown whether a production G2 demands a
+   challenge/response auth before accepting a session; `g2proto` implements no
+   auth step. If the glasses silently ignore the prelude, auth is the first
+   suspect.
+4. **Unbound stand-in ring.** Unverified whether the glasses will accept an unbound
+   impostor ring (or the Flipper as a ring), and what the binding sequence is.
+5. **Double-tap ergonomics.** The 250 ms window (also the latency added to every
+   single tap) and the 500 ms / 100 ms scroll auto-repeat are chosen for feel and
+   are unverified by hand.
+6. **One central at a time.** The glasses likely accept only a single active BLE
+   central, so while the relay runs the phone's Even app will lose (or fail to
+   hold) the link.
+7. **Flipper <-> relay GATT pairing** is a heuristic: the relay picks the first
+   writable characteristic for TX and the first notifiable one for RX on the
+   Serial profile.
+8. **R1-ring UUIDs.** The `bae80001-…` service and `bae80010/11`, `bae80012/13`
+   pairs appear nowhere in this repository; they are recorded as the plan, not as
+   verified repo content.
