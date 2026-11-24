@@ -181,3 +181,151 @@ watch when you first run the stack.
    `g2_controller.c`; real-handed ergonomics are unverified.
 8. **`BYE` on exit** is a recognised token: the relay logs it and does nothing
    else (no `EVT` echo, no render). It is a farewell, not a gesture.
+
+
+---
+
+# RING flow — `g2_ring.fap` (the Flipper impersonates an Even R1 ring)
+
+This is an INDEPENDENT path from the relay above. Instead of feeding a relay, the
+Flipper *is* the ring: it advertises as an R1 and hosts the ring's vendor GATT
+service. **The glasses are the BLE central and dial us.**
+
+Topology:
+
+    Even G2 glasses (BLE central)  --connects to-->  Flipper Zero (BLE peripheral)
+                                                      advertising "EVEN R1_<hex6>" and
+                                                      hosting bae80001-... with the
+                                                      legacy (10/11) + health (12/13)
+                                                      characteristics and the 0x2902 CCCD
+
+## R0. Build
+
+    cd flipper/apps/g2_ring && /home/CachedOut/.local/bin/ufbt
+    # -> flipper/apps/g2_ring/dist/g2_ring.fap   (APPCHK must pass; exit 0)
+
+## R1. Install via qFlipper (there is NO USB mass storage mode)
+
+Identical mechanism to the relay app — qFlipper, not your OS file explorer:
+
+1. Connect the Flipper with a USB-C **data** cable and open **qFlipper**.
+2. **File Manager** tab (left sidebar) — you are browsing the microSD.
+3. Enter `apps/` at the SD root.
+4. **Upload** `dist/g2_ring.fap` into `apps/` → must land at `apps/g2_ring.fap`.
+5. Eject / close qFlipper.
+
+## R2. Run it and read the screen
+
+6. On the Flipper: **Main Menu → Apps → Bluetooth → G2 Ring**.
+
+   ```
+   G2 Ring (R1 fake)                     (o)   <- hollow circle = no central;
+   adv EVEN R1_XXXXXX                           filled disc    = a central is connected
+   con- gls- pair- tch-
+   ----------------------------------------------------------
+   < t02 0205...                                <- rolling log, newest line at the bottom
+   ...
+   ```
+
+   * `adv EVEN R1_XXXXXX` — the advertised name; `XXXXXX` = the last three octets of
+     the Flipper's BLE MAC. This is what an R1 looks like to a scanner.
+   * `con` — a central is connected. `gls` — a link took the GLASSES role (enabled the
+     CCCD on `bae80011`). `pair` — the legacy pair-auth traffic (`00 35 88 00` or a
+     `pairAuth` frame) was seen. `tch` — a `touchSwitch` frame was seen.
+   * The log hex-logs EVERY BLE frame both ways, so a dead button is diagnosable here.
+   * **LEFT** clears the log; **RIGHT** does nothing (not a ring gesture); **BACK** exits.
+
+## R3. Add the Flipper as a ring in the Even app
+
+7. On the phone, open **Even Realities**. Trigger its **ring pairing / add ring** flow
+   (the app scans and matches the ring by NAME in software, so the `EVEN R1_` prefix is
+   what it keys on — not the service UUID).
+8. Watch the Flipper screen while the app scans/connects:
+   * `con` flips to `Y` when the phone or glasses connects.
+   * `gls` flips to `Y` only when a link enables the `bae80011` CCCD (the ring's glasses
+     role) — that is the link gestures will flow down.
+   * a `! pairAuth ...` / `! frame pairAuth` / `! touchSwitch open` line means the app
+     reached the binding handshake.
+9. If the app binds the ring, it hands it the glasses' address (`advStart`) and the
+   glasses then connect **to the Flipper**. Expect `gls Y` and a `! frame advStart` line.
+
+## R4. What to look for when NOTHING happens
+
+Match the symptom to the log — the log is the whole point of the first run:
+
+* **Log stays empty** → the app/glasses never connected. `con` never goes `Y`. The
+  advertised name or the app's scan filter is the suspect; confirm `adv EVEN R1_XXXXXX`
+  is on screen and that the phone sees "EVEN R1_...". See UNKNOWN R5/R6.
+* **`con Y` but no `gls`** → something connected but never enabled the `bae80011` CCCD;
+  no gestures will be sent even if you press buttons (they will log `! noprof`/nothing).
+* **`con Y`, `gls Y`, but pressing buttons logs `! <100ms drop`** → the 100 ms reporter
+  gap swallowed a too-fast double press; space the presses out.
+* **Buttons log `> gst ..` but the glasses do nothing** → the reports are leaving but the
+  glasses are not acting on them. Either the length is wrong (see UNKNOWN R2) or the
+  glasses require a real bind (see UNKNOWN R3/R4).
+* **`< t02 ...` lines never appear** → our handler is not receiving the peer's ATT writes
+  (the CCCD enable / pair-auth would show as `t02` ACL lines). See UNKNOWN R1.
+* **`< t02 ...` lines appear but no `pair`/`gls`** → we ARE seeing traffic but our byte
+  offsets for the ATT handle don't match — compare the raw hex against the expected
+  `[type][handle2][len2][l2cap_len2][cid2][att_op][att_handle2][value...]` (UNKNOWN R1).
+
+### Ring gesture → report bytes (authoritative)
+
+| Button            | TYPE   | 11-byte report on `bae80011`                     |
+|-------------------|--------|--------------------------------------------------|
+| UP (short)        | 0x04   | `00 09 61 00 04 00 00 <TICK_LE32>` (scroll-top)  |
+| DOWN (short)      | 0x05   | `00 09 61 00 05 00 00 <TICK_LE32>` (scroll-bottom)|
+| OK (short)        | 0x01   | `00 09 61 00 01 00 00 <TICK_LE32>` (tap, deferred)|
+| OK (double)       | 0x02   | `00 09 61 00 02 00 00 <TICK_LE32>` (double-tap)  |
+| OK (long)         | 0x00   | `00 09 61 00 00 00 00 <TICK_LE32>` (long-press)  |
+| OK (release)      | 0x08   | `00 09 61 00 08 00 00 <TICK_LE32>` (long-press-release)|
+| LEFT              | —      | not a ring gesture: clears the log; no report    |
+| RIGHT             | —      | not a ring gesture: unmapped; no report          |
+| BACK              | —      | exits; restores the default BLE profile          |
+
+`TICK_LE32` is a 32-bit little-endian millisecond counter; the receiver drops a report
+whose tick advanced by < 100 ms, so the app never fires two reports closer than that.
+
+## KNOWN UNKNOWNS (ring path — confirmable only on real hardware)
+
+These are NOT verified against a physical G2 / Flipper / even app. They are the exact
+points to watch on the first ring run, most-dangerous first.
+
+R1. **Does the service event handler even receive the peer's ATT writes?** We parse the
+    raw packets `ble_event_dispatcher_register_svc_handler` hands us as standard HCI
+    ACL data (`[type=0x02][handle2][len2][l2cap_len2][cid2][att_op][att_handle2][value...]`)
+    and treat ATT `0x12`/`0x52` writes. It is UNVERIFIED that ACL data is delivered to
+    app handlers at all, and that these offsets are right for this stack. The on-screen
+    raw `t02` hex log exists precisely so this can be read off hardware.
+
+R2. **Is the notification length right?** `ble_gatt_characteristic_update` takes the
+    value length from our data callback's `*data_len` (gatt.h: "For updates, called with
+    a context"; length via the `cbBleGattCharacteristicData` out-param). We stage both the
+    bytes and the 11-byte length on every emission, and also pass the staged buffer as
+    `source`. If the implementation instead sends `G2_REPORT_MAX` (33) the glasses will
+    reject the report — check the glasses' behaviour and the bytes on a BLE sniff.
+
+R3. **Will the glasses dial a ring the app never registered?** The Even app is believed
+    to hand the ring the glasses' address (`advStart`); a stand-in that was never
+    registered may simply never be dialed. Unknown.
+
+R4. **Is a BLE bond required before gestures flow?** There is an auth/bonding gate in the
+    vendor app (`BleSecurityGate`, `pairAuth`). It may not sit on the glasses path (the
+    glasses role is said to need no pairAuth) — but this is UNVERIFIED; if the link drops
+    ~20 s after connecting, suspect a rejected/unbound peer.
+
+R5. **Does `bt_service` accept an arbitrary app-supplied profile template at runtime?**
+    The build only proves the symbols resolve. It is UNVERIFIED that
+    `bt_profile_start(bt, &g2_ring_profile_template, app)` actually starts OUR profile and
+    advertises with OUR `GapConfig`, rather than only accepting its built-in profiles.
+    If `adv EVEN R1_...` never appears (and the screen logs `! profile start FAILED`),
+    this is the culprit.
+
+R6. **Discoverability of the advertised 128-bit service UUID.** The Even app scans with a
+    NULL ScanFilter and matches the NAME in software, so the `EVEN R1_` prefix should be
+    what admits us — but if the phone never lists the Flipper, the name pattern or a
+    required manufacturer-data "ER" signature is the suspect.
+
+R7. **Write-characteristic property bits.** The write chars declare `0x04|0x08` (write
+    command AND write request). The real ring reads as `0x04`; if the glasses still get
+    their writes rejected, try narrowing to `0x04` alone.

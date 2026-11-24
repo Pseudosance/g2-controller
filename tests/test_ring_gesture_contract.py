@@ -116,6 +116,14 @@ def main():
           "write property flag is 0x08")
     check(re.search(r"#define\s+GATT_PROP_NOTIFY\s+0x10\b", src) is not None,
           "notify property flag is 0x10")
+    check(re.search(r"#define\s+GATT_PROP_WRITE_WITHOUT_RESP\s+0x04\b", src) is not None,
+          "write-without-response property flag is 0x04")
+    check(src.count("GATT_PROP_WRITE_ANY") >= 2,
+          "both write characteristics declare the widened write property (0x04|0x08 = 0x0C)")
+    # the notification length is conveyed by the data callback's *data_len, so it
+    # must be staged on every gesture emission (not left at the 33-byte max).
+    check("g2_ring_out_len = G2_REPORT_LEN" in src,
+          "notification length is staged on every gesture emission")
     # CCCD 0x2902 present for the notify chars
     check(src.count("0x2902") >= 1, "0x2902 CCCD descriptor is declared")
 

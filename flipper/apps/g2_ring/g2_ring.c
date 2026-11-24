@@ -112,12 +112,29 @@ static const uint8_t r1_uuid_notify_legacy[16] = R1_UUID(0x11);  /* bae80011 */
 static const uint8_t r1_uuid_write_health[16] = R1_UUID(0x12);   /* bae80012 */
 static const uint8_t r1_uuid_notify_health[16] = R1_UUID(0x13);  /* bae80013 */
 
-/* GATT property / type / access bit flags (ble_defs.h). */
-#define GATT_PROP_WRITE  0x08
-#define GATT_PROP_NOTIFY 0x10
+/* GATT property / type / access bit flags.
+ *
+ * Authoritative source (raw lines) --
+ * sdk_headers/f7_sdk/lib/stm32wb_copro/wpan/ble/core/ble_defs.h:
+ *   #define ATTR_ACCESS_READ_WRITE               0x03U
+ *   #define CHAR_PROP_READ                       0x02U
+ *   #define CHAR_PROP_WRITE_WITHOUT_RESP         0x04U
+ *   #define CHAR_PROP_WRITE                      0x08U
+ *   #define CHAR_PROP_NOTIFY                     0x10u
+ *
+ * 0x08 alone is Write WITH response. A peer that sends a Write Command (no
+ * response) to a characteristic declaring only 0x08 has its write REJECTED by
+ * the stack -- which on hardware is indistinguishable from "nothing happens".
+ * The real R1 write chars read as prop=0x04 (write-without-response) and the
+ * legacy pair-auth 00 35 88 00 arrives as a Write Command, so we declare BOTH
+ * bits (0x04|0x08 = 0x0C) and the expected traffic is never rejected. */
+#define GATT_PROP_WRITE_WITHOUT_RESP 0x04
+#define GATT_PROP_WRITE              0x08
+#define GATT_PROP_NOTIFY             0x10
+#define GATT_PROP_WRITE_ANY          (GATT_PROP_WRITE_WITHOUT_RESP | GATT_PROP_WRITE) /* 0x0C */
 #define UUID_TYPE_16BIT  0x01
 #define UUID_TYPE_128BIT 0x02
-/* ATTR_ACCESS_READ_WRITE (0x03) comes from the SDK's ble_defs.h. */
+/* ATTR_ACCESS_READ_WRITE (0x03) comes from the SDK's ble_defs.h (quoted above). */
 
 /* ---- notification report source ---------------------------------------- */
 /* A notify characteristic with callback data is asked for its value when we
@@ -262,6 +279,9 @@ static void g2_ring_emit(G2RingApp* app, uint8_t type, const char* tag) {
             g2_ring_out_buf[8] = (uint8_t)(now >> 8);
             g2_ring_out_buf[9] = (uint8_t)(now >> 16);
             g2_ring_out_buf[10] = (uint8_t)(now >> 24);
+            /* The notification length comes from g2_ring_report_cb's *data_len
+             * (see its header), so stage the 11-byte length on EVERY emission
+             * or the glasses would receive the 33-byte max. */
             g2_ring_out_len = G2_REPORT_LEN;
             sent = ble_gatt_characteristic_update(
                 profile->svc_handle, &profile->ch_notify_legacy, g2_ring_out_buf);
@@ -486,9 +506,9 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
     profile->d_cccd_legacy.is_variable = 0;
     profile->d_cccd_health = profile->d_cccd_legacy;
 
-    g2_ring_fill_char(&profile->p_write_legacy, "r1_write_legacy", r1_uuid_write_legacy, GATT_PROP_WRITE, NULL);
+    g2_ring_fill_char(&profile->p_write_legacy, "r1_write_legacy", r1_uuid_write_legacy, GATT_PROP_WRITE_ANY, NULL);
     g2_ring_fill_char(&profile->p_notify_legacy, "r1_notify_legacy", r1_uuid_notify_legacy, GATT_PROP_NOTIFY, &profile->d_cccd_legacy);
-    g2_ring_fill_char(&profile->p_write_health, "r1_write_health", r1_uuid_write_health, GATT_PROP_WRITE, NULL);
+    g2_ring_fill_char(&profile->p_write_health, "r1_write_health", r1_uuid_write_health, GATT_PROP_WRITE_ANY, NULL);
     g2_ring_fill_char(&profile->p_notify_health, "r1_notify_health", r1_uuid_notify_health, GATT_PROP_NOTIFY, &profile->d_cccd_health);
 
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_write_legacy, &profile->ch_write_legacy);
@@ -569,17 +589,43 @@ static const FuriHalBleProfileTemplate g2_ring_profile_template = {
 };
 
 /* ---- notification report callback -------------------------------------- */
-/* Called at creation with data==NULL to report the max value length, and when
- * we push an update to hand back the staged report. */
+/* HOW THE NOTIFICATION LENGTH IS CONVEYED (authoritative, not guessed):
+ *
+ * sdk_headers/f7_sdk/targets/f7/ble_glue/furi_ble/gatt.h defines
+ *   typedef bool (
+ *       *cbBleGattCharacteristicData)(const void* context, const uint8_t** data, uint16_t* data_len);
+ * with the comments:
+ *   "Is called when characteristic is created to get max data length. Data ptr
+ *    is NULL in this case; the result is passed to aci_gatt_add_char as
+ *    Char_Value_Length"
+ *   "For updates, called with a context - see flipper_gatt_characteristic_update"
+ * and for ble_gatt_characteristic_update():
+ *   "if source==NULL, uses the data from the characteristic: ... For
+ *    callback-based data, callback.context is passed as the context if
+ *    source==NULL".
+ *
+ * So for a CALLBACK-based notify char the value length is whatever this
+ * callback writes to *data_len -- it is NOT taken from a struct field and NOT
+ * from the size of `source`. The header's own discriminator between the two
+ * calls is the `data` pointer: NULL at creation (report the maximum the
+ * attribute may hold), non-NULL during an update (report this report's length
+ * AND its bytes). We therefore STAGE BOTH on every emission:
+ *   - g2_ring_out_buf  -- the report bytes (handed back via *data)
+ *   - g2_ring_out_len  -- the report length (handed back via *data_len)
+ * Both are set in g2_ring_emit()/g2_ring_send_battery() before the update call.
+ * We also pass the staged buffer as `source`, so that if an implementation
+ * instead treats `source` as the data pointer the bytes are identical anyway. */
 static bool g2_ring_report_cb(const void* context, const uint8_t** data, uint16_t* data_len) {
     UNUSED(context);
     if(data == NULL) {
+        /* creation-time length probe: declare the max value length */
         if(data_len) *data_len = G2_REPORT_MAX;
         return false;
     }
+    /* update-time fetch: hand back the staged report bytes and its length */
     if(data_len) *data_len = g2_ring_out_len;
     *data = g2_ring_out_buf;
-    return false; /* we retain ownership */
+    return false; /* we retain ownership; the caller must not free */
 }
 
 /* ---- UI (GUI thread) --------------------------------------------------- */
