@@ -223,6 +223,8 @@ typedef struct G2RingApp G2RingApp;
 
 typedef struct {
     char adv_name[20];
+    uint16_t cccd_legacy;
+    uint16_t cccd_health;
     bool central_connected;
     bool glasses_role;
     bool pair_auth_seen;
@@ -239,6 +241,13 @@ typedef struct {
     G2RingApp* app;
 
     uint16_t svc_handle;
+
+    /* CCCD (0x2902) handle for each notify characteristic. The stack does not
+     * report it (descriptor_handle stays 0 on the auto-allocated path), so it is
+     * derived as the notify value handle + 1 -- the CCCD sits immediately after
+     * its characteristic on the observed handle sequence (nl=0x15 -> 0x16). */
+    uint16_t cccd_legacy;
+    uint16_t cccd_health;
 
     BleGattCharacteristicParams p_write_legacy;
     BleGattCharacteristicParams p_notify_legacy;
@@ -274,6 +283,7 @@ struct G2RingApp {
     bool central_connected;
     bool glasses_role;
     bool svc_ok;
+    bool saw_connection; /* a real central has connected at least once (BLE thread) */
 };
 
 enum {
@@ -463,16 +473,22 @@ static void
     static char line[64];
     hexify(hex, sizeof(hex), val, vlen > 12 ? 12 : vlen);
 
-    /* (a) Enabling the CCCD on the notify/legacy char (bae80011) means this
-     * link has taken the ring's GLASSES role. That is where gestures go. */
-    if(profile->ch_notify_legacy.descriptor_handle != 0 &&
-       handle == profile->ch_notify_legacy.descriptor_handle) {
+    /* (a) A write to the legacy notify CCCD (bae80011's 0x2902) means this link
+     * has taken the ring's GLASSES role. That is where gestures go. On the
+     * auto-allocated path descriptor_handle is 0, so the CCCD handle is the
+     * notify value handle + 1 (computed at profile start as cccd_legacy); the
+     * subscription arrives as an ATT write to exactly that handle. */
+    if(handle == profile->cccd_legacy) {
         bool enabled = vlen >= 1 && (val[0] & 0x01) != 0;
         g2_ring_set_glasses(app, enabled);
         g2_ring_log(app, enabled ? "! GLASSES role ON" : "! glasses role off");
         if(enabled) {
             view_dispatcher_send_custom_event(app->view_dispatcher, G2RingEventSendBattery);
         }
+        return;
+    }
+    if(handle == profile->cccd_health) {
+        g2_ring_log(app, "! health CCCD wr");
         return;
     }
 
@@ -657,6 +673,20 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
     }
     profile->svc_ok = svc_ok;
 
+    /* Derive the CCCD handle for each notify characteristic. ble_gatt_
+     * characteristic_init leaves descriptor_handle = 0 on the auto-allocated path
+     * (it fills instance.descriptor_handle only when descriptor_params != NULL).
+     * The CCCD 0x2902 the STM32WB auto-allocates for a notify char sits
+     * immediately after the value attribute, i.e. at (value handle + 1) -- the
+     * observed sequence wl=0x13 nl=0x15 wh=0x18 nh=0x20 proves it. Prefer a
+     * reported descriptor handle if one ever appears, else use value+1. */
+    profile->cccd_legacy = profile->ch_notify_legacy.descriptor_handle
+                               ? profile->ch_notify_legacy.descriptor_handle
+                               : (uint16_t)(profile->ch_notify_legacy.handle + 1);
+    profile->cccd_health = profile->ch_notify_health.descriptor_handle
+                               ? profile->ch_notify_health.descriptor_handle
+                               : (uint16_t)(profile->ch_notify_health.handle + 1);
+
     profile->svc_handler = ble_event_dispatcher_register_svc_handler(g2_ring_svc_event_cb, profile);
 
     if(app) {
@@ -690,6 +720,19 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
             profile->ch_notify_health.handle,
             profile->ch_notify_health.descriptor_handle);
         g2_ring_log(app, diag);
+        /* The computed CCCD handles. They must be on screen so the glasses-role
+         * subscription is unambiguous on the next hardware run. */
+        snprintf(
+            diag, sizeof(diag), "ccd nl%02X nh%02X", profile->cccd_legacy, profile->cccd_health);
+        g2_ring_log(app, diag);
+        with_view_model(
+            app->view,
+            G2RingModel * m,
+            {
+                m->cccd_legacy = profile->cccd_legacy;
+                m->cccd_health = profile->cccd_health;
+            },
+            true);
     }
     FURI_LOG_I(
         TAG,
@@ -746,6 +789,30 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
 
     cfg->bonding_mode = true;
     cfg->pairing_method = GapPairingPinCodeShow;
+
+    /* Fields the shipped ble_profile_serial_get_config sets that a zeroed config
+     * does NOT. Disassembled from firmware.elf at 0x0800152d: it memcpy()s the
+     * same 80-byte .rodata template (0x080a1438) and then writes, field for
+     * field, cfg+48 = 6 bytes of furi_hal_version_get_ble_mac() (the device MAC)
+     * and cfg+54 = the device name. The template it copies already carries
+     * appearance_char = 0x8600 (offset 44), bonding_mode = 1 (46),
+     * pairing_method = 1 (47) and conn_param = {min 6, max 36} (offsets 72/74).
+     * All three of these reach the radio: gap_init writes the MAC via
+     * aci_hal_write_config_data(0x30, ...), the appearance via
+     * aci_gatt_update_char_value (GAP Appearance char), and
+     * gap_verify_connection_parameters reads conn_param at cfg+72/+74 for
+     * aci_l2cap_connection_parameter_update_req. A zeroed config therefore
+     * advertised a NULL public address (00:00:00:00:00:00) -- the prime suspect
+     * for "advertising but never connectable". We now set all three, matching the
+     * shipped profile exactly. */
+    memcpy(cfg->mac_address, mac, sizeof(cfg->mac_address));
+    /* Same value the shipped serial template carries; its meaning for a ring is
+     * UNVERIFIED, but the one shipped reference sets it. */
+    cfg->appearance_char = 0x8600;
+    /* 6/36 (7.5ms..45ms), the shipped template's connection-param request;
+     * 0 was below the spec minimum. */
+    cfg->conn_param.conn_int_min = 6;
+    cfg->conn_param.conn_int_max = 36;
 
     if(app) {
         with_view_model(
@@ -838,11 +905,15 @@ static void g2_ring_draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str(canvas, 2, 28, buf);
     }
     canvas_draw_line(canvas, 0, 31, 127, 31);
+    /* The computed CCCD handles, always on screen so the glasses-role
+     * subscription can be matched against an incoming ATT write by eye. */
+    snprintf(buf, sizeof(buf), "ccd nl%02X nh%02X", m->cccd_legacy, m->cccd_health);
+    canvas_draw_str(canvas, 2, 37, buf);
 
     uint8_t n = m->count < 4 ? m->count : 4;
     for(uint8_t i = 0; i < n; i++) {
         uint8_t idx = (uint8_t)((m->head - n + i + LOG_LINES) % LOG_LINES);
-        canvas_draw_str(canvas, 2, (int32_t)(40 + i * 6), m->lines[idx]);
+        canvas_draw_str(canvas, 2, (int32_t)(44 + i * 6), m->lines[idx]);
     }
 }
 
@@ -923,8 +994,26 @@ static void g2_ring_bt_status_callback(BtStatus status, void* context) {
     G2RingApp* app = context;
     bool connected = (status == BtStatusConnected);
     g2_ring_set_link(app, connected);
-    if(!connected) g2_ring_set_glasses(app, false); /* the role is per-link */
-    g2_ring_log(app, connected ? "! central connected" : "! central gone");
+    if(connected) {
+        app->saw_connection = true;
+        g2_ring_log(app, "! central connected");
+        return;
+    }
+    g2_ring_set_glasses(app, false); /* the role is per-link */
+    if(app->saw_connection) {
+        /* A real link was up and has now dropped: this is a genuine loss. */
+        app->saw_connection = false;
+        g2_ring_log(app, "! central gone");
+    } else {
+        /* SPURIOUS-STARTUP GUARD. bt_service invokes this callback on every
+         * status change, and gap.c emits GapEventTypeStartAdvertising when the
+         * radio begins advertising -- i.e. a status change fires BEFORE any
+         * central has ever connected. Printing "central gone" here claimed a link
+         * was lost when none ever existed. Name the real status instead. */
+        char b[LOG_LINE_LEN];
+        snprintf(b, sizeof(b), "bt st%d", (int)status);
+        g2_ring_log(app, b);
+    }
 }
 
 /* ---- entry point ------------------------------------------------------- */

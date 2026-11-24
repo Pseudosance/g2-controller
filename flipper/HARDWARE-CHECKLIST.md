@@ -223,6 +223,7 @@ Identical mechanism to the relay app — qFlipper, not your OS file explorer:
    adv EVEN R1_XXXXXX                           filled disc    = a central is connected
    con- gls- pair- tch-
    ----------------------------------------------------------
+   ccd nl16 nh21                                <- computed CCCD handles (bae80011/bae80013)
    < t02 0205...                                <- rolling log, newest line at the bottom
    ...
    ```
@@ -232,6 +233,15 @@ Identical mechanism to the relay app — qFlipper, not your OS file explorer:
    * `con` — a central is connected. `gls` — a link took the GLASSES role (enabled the
      CCCD on `bae80011`). `pair` — the legacy pair-auth traffic (`00 35 88 00` or a
      `pairAuth` frame) was seen. `tch` — a `touchSwitch` frame was seen.
+   * `ccd nlXX nhXX` — the CCCD (0x2902) handles the app derives for the two notify
+     characteristics as (notify value handle + 1), since the stack reports neither
+     (descriptor_handle = 0 on the auto-allocated path). With the observed handles
+     (nl=0x15, nh=0x20) these are `nl16` / `nh21`. `gls` flips to `Y` when an ATT write
+     arrives at `nl16`; a write to `nh21` logs `! health CCCD wr`.
+   * `! central gone` is printed ONLY after a real connection was first seen. The BT
+     status callback fires on every status change — including Advertising at startup —
+     so before any central has connected the log names the raw status (`bt st2` =
+     advertising) instead of claiming a link was lost.
    * The log hex-logs EVERY BLE frame both ways, so a dead button is diagnosable here.
    * **LEFT** clears the log; **RIGHT** does nothing (not a ring gesture); **BACK** exits.
 
