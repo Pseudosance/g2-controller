@@ -134,6 +134,18 @@ static const uint8_t r1_uuid_notify_health[16] = R1_UUID(0x13);  /* bae80013 */
 #define GATT_PROP_WRITE_ANY          (GATT_PROP_WRITE_WITHOUT_RESP | GATT_PROP_WRITE) /* 0x0C */
 #define UUID_TYPE_16BIT  0x01
 #define UUID_TYPE_128BIT 0x02
+/* Service_Type for ble_gatt_service_add. Authoritative source (raw lines) --
+ * sdk_headers/f7_sdk/lib/stm32wb_copro/wpan/ble/core/ble_defs.h:
+ *   #define PRIMARY_SERVICE                            0x01U
+ *   #define SECONDARY_SERVICE                          0x02U
+ * A vendor service is a PRIMARY service: shipped working services pass 0x01
+ * (ble_svc_serial_start and ble_svc_battery_start both set r2=1 before the
+ * call -- see the disassembly notes). ble_gatt_service_add forwards the
+ * Service_Type byte verbatim to the STM32WB coprocessor (aci_gatt_add_service
+ * copies it straight into the ACI command; it is NOT range-checked on the
+ * Flipper side), so 0x00 -- neither PRIMARY nor SECONDARY -- is rejected at
+ * runtime and ble_gatt_service_add returns false. */
+#define GATT_SERVICE_PRIMARY 0x01
 /* ATTR_ACCESS_READ_WRITE (0x03) comes from the SDK's ble_defs.h (quoted above). */
 
 /* Attribute-write notification mask passed to the stack per characteristic.
@@ -565,7 +577,12 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
     Service_UUID_t su;
     memset(&su, 0, sizeof(su));
     memcpy(su.Service_UUID_128, r1_uuid_service, sizeof(r1_uuid_service));
-    if(!ble_gatt_service_add(UUID_TYPE_128BIT, &su, 0x00, 20, &profile->svc_handle)) {
+    /* Service_Type = GATT_SERVICE_PRIMARY (0x01). The previous build passed
+     * 0x00, which is not a defined Service_Type and made the coprocessor reject
+     * the whole service add. */
+    bool svc_add_ok = ble_gatt_service_add(
+        UUID_TYPE_128BIT, &su, GATT_SERVICE_PRIMARY, 20, &profile->svc_handle);
+    if(!svc_add_ok) {
         FURI_LOG_E(TAG, "ble_gatt_service_add failed");
         svc_ok = false;
     }
@@ -608,13 +625,43 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
         app->svc_ok = svc_ok;
         furi_mutex_release(app->mutex);
     }
+    /* ---- fine-grained GATT bring-up diagnostics ------------------------
+     * One line per stage so a hardware run NAMES the exact attribute the stack
+     * refused instead of a single boolean. A zero handle marks the specific
+     * characteristic/descriptor that failed. */
+    if(app) {
+        char diag[LOG_LINE_LEN];
+        snprintf(diag, sizeof(diag), "svcAdd=%d h=%u", (int)svc_add_ok, profile->svc_handle);
+        g2_ring_log(app, diag);
+        snprintf(
+            diag,
+            sizeof(diag),
+            "wl%u nl%u dl%u",
+            profile->ch_write_legacy.handle,
+            profile->ch_notify_legacy.handle,
+            profile->ch_notify_legacy.descriptor_handle);
+        g2_ring_log(app, diag);
+        snprintf(
+            diag,
+            sizeof(diag),
+            "wh%u nh%u dh%u",
+            profile->ch_write_health.handle,
+            profile->ch_notify_health.handle,
+            profile->ch_notify_health.descriptor_handle);
+        g2_ring_log(app, diag);
+    }
     FURI_LOG_I(
         TAG,
-        "R1 profile up: ok=%d svc=%u nleg.handle=%u cccd=%u",
+        "R1 up: ok=%d add=%d svc=%u wl=%u nl=%u dl=%u wh=%u nh=%u dh=%u",
         (int)svc_ok,
+        (int)svc_add_ok,
         profile->svc_handle,
+        profile->ch_write_legacy.handle,
         profile->ch_notify_legacy.handle,
-        profile->ch_notify_legacy.descriptor_handle);
+        profile->ch_notify_legacy.descriptor_handle,
+        profile->ch_write_health.handle,
+        profile->ch_notify_health.handle,
+        profile->ch_notify_health.descriptor_handle);
     return (FuriHalBleProfileBase*)profile;
 }
 
