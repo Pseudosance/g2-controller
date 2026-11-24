@@ -136,12 +136,41 @@ static const uint8_t r1_uuid_notify_health[16] = R1_UUID(0x13);  /* bae80013 */
 #define UUID_TYPE_128BIT 0x02
 /* ATTR_ACCESS_READ_WRITE (0x03) comes from the SDK's ble_defs.h (quoted above). */
 
+/* Attribute-write notification mask passed to the stack per characteristic.
+ * Authoritative source (raw lines) --
+ * sdk_headers/f7_sdk/lib/stm32wb_copro/wpan/ble/core/ble_defs.h:
+ *   #define GATT_DONT_NOTIFY_EVENTS                       0x00U
+ *   #define GATT_NOTIFY_ATTRIBUTE_WRITE                   0x01U
+ *   #define GATT_NOTIFY_WRITE_REQ_AND_WAIT_FOR_APPL_RESP  0x02U
+ *   #define GATT_NOTIFY_READ_REQ_AND_WAIT_FOR_APPL_RESP   0x04U
+ *   #define GATT_NOTIFY_NOTIFICATION_COMPLETION           0x08U
+ *
+ * DECISION: the write chars use GATT_NOTIFY_ATTRIBUTE_WRITE (0x01) -- "tell the
+ * app about the write", with NO obligation to answer -- and notify chars use
+ * GATT_DONT_NOTIFY_EVENTS (0x00). We deliberately do NOT set
+ * GATT_NOTIFY_WRITE_REQ_AND_WAIT_FOR_APPL_RESP (0x02): that bit makes the stack
+ * WAIT for an application write-response, and our handler only observes and
+ * returns BleEventAckFlowEnable -- it never issues a response -- so 0x02 would
+ * leave the peer's write unacknowledged. Writes are observed via the raw event
+ * dispatcher (ble_event_dispatcher_register_svc_handler), not by servicing a
+ * wait. (0x04/0x08 are read-wait and notify-completion and are not needed.)
+ *
+ * These three names are #defined by ble_defs.h (quoted above); the code USES
+ * them directly and does not redefine them. */
+
 /* ---- notification report source ---------------------------------------- */
 /* A notify characteristic with callback data is asked for its value when we
  * call ble_gatt_characteristic_update(). We stage the current report here and
  * the callback hands it back. Guarded by app->mutex around writes. */
 static uint8_t g2_ring_out_buf[G2_REPORT_MAX];
-static uint16_t g2_ring_out_len;
+/* FIX 2: initialise to the MAX, never 0. The creation-time invocation of the
+ * data callback is what sets the characteristic's maximum value length. If the
+ * stack calls it with a non-NULL `data` (the other reading of the contract in
+ * gatt.h), the callback returns this staged length -- a 0 here would define an
+ * unusable ZERO-length characteristic, which is fatal and silent. With the max
+ * staged, BOTH readings yield a non-zero length at creation, and every emission
+ * then stages the real (11- or 6-byte) length. */
+static uint16_t g2_ring_out_len = G2_REPORT_MAX;
 
 /* Static scratch backing the (fixed-data) write characteristics. */
 static uint8_t g2_ring_write_scratch[20];
@@ -160,6 +189,7 @@ typedef struct {
     bool glasses_role;
     bool pair_auth_seen;
     bool touch_seen;
+    bool svc_error; /* GATT service/characteristic creation failed: persistent */
     char lines[LOG_LINES][LOG_LINE_LEN];
     uint8_t head;
     uint8_t count;
@@ -185,6 +215,7 @@ typedef struct {
     BleGattCharacteristicInstance ch_notify_health;
 
     GapSvcEventHandler* svc_handler;
+    bool svc_ok; /* service + all characteristics created successfully */
 } G2RingProfile;
 
 struct G2RingApp {
@@ -200,6 +231,13 @@ struct G2RingApp {
     bool ok_tap_pending;      /* deferred single tap armed (GUI thread only) */
     bool ok_long_active;      /* a long press is in progress (GUI thread only) */
     uint32_t last_report_ms;
+
+    /* Link/role/health state, mirrored from the model so the GUI-thread emit
+     * path can consult it under `mutex` without taking the model lock.
+     * Written on the BLE thread via the g2_ring_set_* helpers below. */
+    bool central_connected;
+    bool glasses_role;
+    bool svc_ok;
 };
 
 enum {
@@ -231,7 +269,24 @@ static void g2_ring_log(G2RingApp* app, const char* s) {
 }
 
 static void g2_ring_set_glasses(G2RingApp* app, bool on) {
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    app->glasses_role = on;
+    furi_mutex_release(app->mutex);
     with_view_model(app->view, G2RingModel * m, { m->glasses_role = on; }, true);
+}
+
+static void g2_ring_set_link(G2RingApp* app, bool on) {
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    app->central_connected = on;
+    furi_mutex_release(app->mutex);
+    with_view_model(app->view, G2RingModel * m, { m->central_connected = on; }, true);
+}
+
+static void g2_ring_set_svc_error(G2RingApp* app) {
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    app->svc_ok = false;
+    furi_mutex_release(app->mutex);
+    with_view_model(app->view, G2RingModel * m, { m->svc_error = true; }, true);
 }
 
 static void g2_ring_set_pair_auth(G2RingApp* app) {
@@ -255,53 +310,67 @@ static void hexify(char* out, size_t outlen, const uint8_t* b, size_t n) {
 
 /* ---- gesture emission (ALWAYS on the GUI thread) ----------------------- */
 
+/* FIX 1: the emission gate. A report is sent ONLY when the profile exists, the
+ * GATT service was created, a central is connected, AND this link holds the
+ * ring's GLASSES role (its CCCD on bae80011 was enabled, i.e. a subscriber
+ * exists). Anything else prints a DISTINCT line naming the reason -- never a
+ * success-looking one -- so the screen tells "bytes left the radio" apart from
+ * "nothing happened". The tx result is honest too: a rejected update reads
+ * differently from a good one. */
 static void g2_ring_emit(G2RingApp* app, uint8_t type, const char* tag) {
     uint32_t now = g2_ring_now_ms();
+    char line[LOG_LINE_LEN];
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     G2RingProfile* profile = app->profile;
-    bool sent = false;
-    bool too_soon = false;
+    bool svc_ok = app->svc_ok;
+    bool connected = app->central_connected;
+    bool glasses = app->glasses_role;
 
-    if(profile) {
-        if((now - app->last_report_ms) < G2_MIN_REPORT_GAP_MS) {
-            too_soon = true; /* the receiver would drop it anyway */
+    if(profile == NULL) {
+        furi_mutex_release(app->mutex);
+        snprintf(line, sizeof(line), "! no profile %02X", type);
+    } else if(!svc_ok) {
+        furi_mutex_release(app->mutex);
+        snprintf(line, sizeof(line), "! svc broken %02X", type);
+    } else if(!connected) {
+        furi_mutex_release(app->mutex);
+        snprintf(line, sizeof(line), "! no link %02X", type);
+    } else if(!glasses) {
+        furi_mutex_release(app->mutex);
+        snprintf(line, sizeof(line), "! no gls role %02X", type);
+    } else if((now - app->last_report_ms) < G2_MIN_REPORT_GAP_MS) {
+        furi_mutex_release(app->mutex);
+        snprintf(line, sizeof(line), "! <100ms %02X", type);
+    } else {
+        memset(g2_ring_out_buf, 0, sizeof(g2_ring_out_buf));
+        g2_ring_out_buf[0] = 0x00;
+        g2_ring_out_buf[1] = 0x09;
+        g2_ring_out_buf[2] = 0x61;
+        g2_ring_out_buf[3] = 0x00;
+        g2_ring_out_buf[4] = type;
+        g2_ring_out_buf[5] = 0x00; /* AUX */
+        g2_ring_out_buf[6] = 0x00; /* SPEED */
+        g2_ring_out_buf[7] = (uint8_t)(now);
+        g2_ring_out_buf[8] = (uint8_t)(now >> 8);
+        g2_ring_out_buf[9] = (uint8_t)(now >> 16);
+        g2_ring_out_buf[10] = (uint8_t)(now >> 24);
+        /* The notification length comes from g2_ring_report_cb's *data_len (see
+         * its header), so stage the 11-byte length on EVERY emission or the
+         * glasses would receive the 33-byte max. */
+        g2_ring_out_len = G2_REPORT_LEN;
+        bool sent = ble_gatt_characteristic_update(
+            profile->svc_handle, &profile->ch_notify_legacy, g2_ring_out_buf);
+        if(sent) app->last_report_ms = now; /* only a real send arms the gap */
+        furi_mutex_release(app->mutex);
+        if(sent) {
+            snprintf(line, sizeof(line), "> gst %02X %s SENT", type, tag);
         } else {
-            memset(g2_ring_out_buf, 0, sizeof(g2_ring_out_buf));
-            g2_ring_out_buf[0] = 0x00;
-            g2_ring_out_buf[1] = 0x09;
-            g2_ring_out_buf[2] = 0x61;
-            g2_ring_out_buf[3] = 0x00;
-            g2_ring_out_buf[4] = type;
-            g2_ring_out_buf[5] = 0x00; /* AUX */
-            g2_ring_out_buf[6] = 0x00; /* SPEED */
-            g2_ring_out_buf[7] = (uint8_t)(now);
-            g2_ring_out_buf[8] = (uint8_t)(now >> 8);
-            g2_ring_out_buf[9] = (uint8_t)(now >> 16);
-            g2_ring_out_buf[10] = (uint8_t)(now >> 24);
-            /* The notification length comes from g2_ring_report_cb's *data_len
-             * (see its header), so stage the 11-byte length on EVERY emission
-             * or the glasses would receive the 33-byte max. */
-            g2_ring_out_len = G2_REPORT_LEN;
-            sent = ble_gatt_characteristic_update(
-                profile->svc_handle, &profile->ch_notify_legacy, g2_ring_out_buf);
-            app->last_report_ms = now;
+            snprintf(line, sizeof(line), "! tx REJECTED %02X", type);
         }
     }
-    furi_mutex_release(app->mutex);
-
-    char line[LOG_LINE_LEN];
-    if(!profile) {
-        snprintf(line, sizeof(line), "! noprof drop %02X", type);
-    } else if(too_soon) {
-        snprintf(line, sizeof(line), "! <100ms drop %02X", type);
-    } else if(!sent) {
-        snprintf(line, sizeof(line), "! FAIL tx %02X", type);
-    } else {
-        snprintf(line, sizeof(line), "> gst %02X %s", type, tag);
-    }
     g2_ring_log(app, line);
-    if(sent) FURI_LOG_I(TAG, "gesture 0x%02X %s", type, tag);
+    FURI_LOG_I(TAG, "%s", line);
 }
 
 /* Accept reply: the ring answers an accepted peer on bae80011 with a battery
@@ -310,7 +379,7 @@ static void g2_ring_send_battery(G2RingApp* app) {
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     G2RingProfile* profile = app->profile;
     bool sent = false;
-    if(profile) {
+    if(profile && app->svc_ok && app->central_connected && app->glasses_role) {
         memset(g2_ring_out_buf, 0, sizeof(g2_ring_out_buf));
         g2_ring_out_buf[0] = 0x00;
         g2_ring_out_buf[1] = 0x09;
@@ -324,7 +393,7 @@ static void g2_ring_send_battery(G2RingApp* app) {
         app->last_report_ms = g2_ring_now_ms();
     }
     furi_mutex_release(app->mutex);
-    g2_ring_log(app, sent ? "> bat 0064" : "! bat fail");
+    g2_ring_log(app, sent ? "> bat 0064 SENT" : "! bat not sent");
 }
 
 /* ---- deferred single tap (GUI thread) ---------------------------------- */
@@ -467,8 +536,12 @@ static void g2_ring_fill_char(
     memcpy(p->uuid.Char_UUID_128, uuid, 16);
     p->char_properties = props;
     p->security_permissions = 0x00;
-    /* 0x02: invoke the service handler when this attribute is written. */
-    p->gatt_evt_mask = (props & GATT_PROP_NOTIFY) ? 0x00 : 0x02;
+    /* Write chars: GATT_NOTIFY_ATTRIBUTE_WRITE (0x01) -- notify the app about a
+     * write, no wait. We do NOT use GATT_NOTIFY_WRITE_REQ_AND_WAIT_FOR_APPL_RESP
+     * (0x02): it would make the stack wait for a write-response we never issue.
+     * See the decision block where these are defined. */
+    p->gatt_evt_mask =
+        (props & GATT_PROP_NOTIFY) ? GATT_DONT_NOTIFY_EVENTS : GATT_NOTIFY_ATTRIBUTE_WRITE;
     p->is_variable = 1;
     if(props & GATT_PROP_NOTIFY) {
         p->data_prop_type = FlipperGattCharacteristicDataCallback;
@@ -488,11 +561,13 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
     profile->base.config = &g2_ring_profile_template;
     profile->app = app;
 
+    bool svc_ok = true;
     Service_UUID_t su;
     memset(&su, 0, sizeof(su));
     memcpy(su.Service_UUID_128, r1_uuid_service, sizeof(r1_uuid_service));
     if(!ble_gatt_service_add(UUID_TYPE_128BIT, &su, 0x00, 20, &profile->svc_handle)) {
         FURI_LOG_E(TAG, "ble_gatt_service_add failed");
+        svc_ok = false;
     }
 
     /* 0x2902 Client Characteristic Configuration descriptor for each notify. */
@@ -516,16 +591,27 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_write_health, &profile->ch_write_health);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_notify_health, &profile->ch_notify_health);
 
+    /* FIX 3: characteristic creation returns void, so detect failure via the
+     * resulting handles. A zero handle means the attribute was not created. */
+    if(profile->ch_write_legacy.handle == 0 || profile->ch_notify_legacy.handle == 0 ||
+       profile->ch_write_health.handle == 0 || profile->ch_notify_health.handle == 0) {
+        FURI_LOG_E(TAG, "characteristic init produced a zero handle");
+        svc_ok = false;
+    }
+    profile->svc_ok = svc_ok;
+
     profile->svc_handler = ble_event_dispatcher_register_svc_handler(g2_ring_svc_event_cb, profile);
 
     if(app) {
         furi_mutex_acquire(app->mutex, FuriWaitForever);
         app->profile = profile;
+        app->svc_ok = svc_ok;
         furi_mutex_release(app->mutex);
     }
     FURI_LOG_I(
         TAG,
-        "R1 profile up: svc=%u nleg.handle=%u cccd=%u",
+        "R1 profile up: ok=%d svc=%u nleg.handle=%u cccd=%u",
+        (int)svc_ok,
         profile->svc_handle,
         profile->ch_notify_legacy.handle,
         profile->ch_notify_legacy.descriptor_handle);
@@ -636,7 +722,7 @@ static void g2_ring_draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_color(canvas, ColorBlack);
 
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 9, "G2 Ring (R1 fake)");
+    canvas_draw_str(canvas, 2, 9, m->svc_error ? "G2 Ring *SVC ERR*" : "G2 Ring (R1 fake)");
     if(m->central_connected) {
         canvas_draw_disc(canvas, 122, 6, 3);
     } else {
@@ -645,17 +731,24 @@ static void g2_ring_draw_callback(Canvas* canvas, void* ctx) {
 
     canvas_set_font(canvas, FontSecondary);
     char buf[32];
-    snprintf(buf, sizeof(buf), "adv %s", m->adv_name[0] ? m->adv_name : "(none)");
-    canvas_draw_str(canvas, 2, 19, buf);
-    snprintf(
-        buf,
-        sizeof(buf),
-        "con%c gls%c pair%c tch%c",
-        m->central_connected ? 'Y' : '-',
-        m->glasses_role ? 'Y' : '-',
-        m->pair_auth_seen ? 'Y' : '-',
-        m->touch_seen ? 'Y' : '-');
-    canvas_draw_str(canvas, 2, 28, buf);
+    if(m->svc_error) {
+        /* FIX 3: persistent, explicit error state -- we must NOT claim to be a
+         * usable ring when the GATT service was never created. */
+        canvas_draw_str(canvas, 2, 19, "!! GATT create FAILED");
+        canvas_draw_str(canvas, 2, 28, "NOT a usable ring");
+    } else {
+        snprintf(buf, sizeof(buf), "adv %s", m->adv_name[0] ? m->adv_name : "(none)");
+        canvas_draw_str(canvas, 2, 19, buf);
+        snprintf(
+            buf,
+            sizeof(buf),
+            "con%c gls%c pair%c tch%c",
+            m->central_connected ? 'Y' : '-',
+            m->glasses_role ? 'Y' : '-',
+            m->pair_auth_seen ? 'Y' : '-',
+            m->touch_seen ? 'Y' : '-');
+        canvas_draw_str(canvas, 2, 28, buf);
+    }
     canvas_draw_line(canvas, 0, 31, 127, 31);
 
     uint8_t n = m->count < 4 ? m->count : 4;
@@ -741,8 +834,8 @@ static bool g2_ring_custom_event_callback(void* context, uint32_t event) {
 static void g2_ring_bt_status_callback(BtStatus status, void* context) {
     G2RingApp* app = context;
     bool connected = (status == BtStatusConnected);
-    with_view_model(
-        app->view, G2RingModel * m, { m->central_connected = connected; }, true);
+    g2_ring_set_link(app, connected);
+    if(!connected) g2_ring_set_glasses(app, false); /* the role is per-link */
     g2_ring_log(app, connected ? "! central connected" : "! central gone");
 }
 
@@ -778,9 +871,20 @@ int32_t g2_ring_app(void* p) {
     bt_set_status_changed_callback(app->bt, g2_ring_bt_status_callback, app);
 
     FuriHalBleProfileBase* base = bt_profile_start(app->bt, &g2_ring_profile_template, app);
+    bool svc_ok = false;
+    if(base != NULL) {
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        svc_ok = app->svc_ok;
+        furi_mutex_release(app->mutex);
+    }
     if(base == NULL) {
         FURI_LOG_E(TAG, "bt_profile_start failed; staying on the default profile");
+        g2_ring_set_svc_error(app);
         g2_ring_log(app, "! profile start FAILED");
+    } else if(!svc_ok) {
+        FURI_LOG_E(TAG, "GATT service not created; not a usable ring");
+        g2_ring_set_svc_error(app);
+        g2_ring_log(app, "! GATT create FAILED");
     } else {
         g2_ring_log(app, "! advertising as R1");
     }

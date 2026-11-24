@@ -251,18 +251,35 @@ Identical mechanism to the relay app — qFlipper, not your OS file explorer:
 
 ## R4. What to look for when NOTHING happens
 
-Match the symptom to the log — the log is the whole point of the first run:
+The log is the whole point of the first run. **A button press that does not put
+bytes on the radio prints an explicit `!` line naming the reason — never a
+success-looking line.** What the screen prints for each failure mode:
 
-* **Log stays empty** → the app/glasses never connected. `con` never goes `Y`. The
-  advertised name or the app's scan filter is the suspect; confirm `adv EVEN R1_XXXXXX`
-  is on screen and that the phone sees "EVEN R1_...". See UNKNOWN R5/R6.
-* **`con Y` but no `gls`** → something connected but never enabled the `bae80011` CCCD;
-  no gestures will be sent even if you press buttons (they will log `! noprof`/nothing).
-* **`con Y`, `gls Y`, but pressing buttons logs `! <100ms drop`** → the 100 ms reporter
-  gap swallowed a too-fast double press; space the presses out.
-* **Buttons log `> gst ..` but the glasses do nothing** → the reports are leaving but the
-  glasses are not acting on them. Either the length is wrong (see UNKNOWN R2) or the
-  glasses require a real bind (see UNKNOWN R3/R4).
+| Press line                  | Meaning                                                        |
+|-----------------------------|---------------------------------------------------------------|
+| `> gst 04 scroll-top SENT`  | report written to the radio (good)                            |
+| `! no profile 04`           | `bt_profile_start` did not install our profile                 |
+| `! svc broken 04`           | GATT service/characteristic creation failed (screen `*SVC ERR*`)|
+| `! no link 04`              | no central connected (`con-`)                                  |
+| `! no gls role 04`          | connected but no link enabled the `bae80011` CCCD (no subscriber)|
+| `! <100ms 04`               | a report went out <100 ms ago (receiver would drop this)       |
+| `! tx REJECTED 04`          | `ble_gatt_characteristic_update` returned false                |
+
+(`TT` is the gesture TYPE byte: `04`=scroll-top, `05`=scroll-bottom, `01`=tap,
+`02`=double-tap, `00`=long-press, `08`=long-press-release.)
+
+Startup / battery lines: `! advertising as R1`, `! GATT create FAILED`,
+`! profile start FAILED`, `> bat 0064 SENT`, `! bat not sent`.
+
+Symptoms that are NOT a button press:
+
+* **Log stays empty and `con-`** → nothing connected. Confirm `adv EVEN R1_XXXXXX` is on
+  screen and the phone lists "EVEN R1_...". See UNKNOWN R5/R6.
+* **Screen shows `*SVC ERR*` / `!! GATT create FAILED`** → the service was never created,
+  so the app is NOT a usable ring (it deliberately does not claim to be). See UNKNOWN R5.
+* **Buttons log `> gst .. SENT` but the glasses do nothing** → bytes are leaving the radio
+  but the glasses are not acting on them: wrong report length (UNKNOWN R2) or the glasses
+  require a real bind (UNKNOWN R3/R4).
 * **`< t02 ...` lines never appear** → our handler is not receiving the peer's ATT writes
   (the CCCD enable / pair-auth would show as `t02` ACL lines). See UNKNOWN R1.
 * **`< t02 ...` lines appear but no `pair`/`gls`** → we ARE seeing traffic but our byte

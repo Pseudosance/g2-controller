@@ -131,6 +131,35 @@ def main():
     check(re.search(r"#define\s+G2_MIN_REPORT_GAP_MS\s+100\b", src) is not None,
           "minimum inter-report gap is 100 ms (receiver drops <100 ms)")
 
+    # ---- 6. FIX 1: emission is gated; failures print DISTINCT lines ------
+    emit = c_function_body(src, "static void g2_ring_emit")
+    for token in ("central_connected", "glasses_role", "svc_ok"):
+        check(token in emit, "emission gate consults %s" % token)
+    for lit in ('"> gst %02X %s SENT"', '"! no link %02X"', '"! no gls role %02X"',
+                '"! tx REJECTED %02X"', '"! svc broken %02X"', '"! no profile %02X"'):
+        check(lit in emit, "emit prints a distinct line %s" % lit)
+    # a rejected update must read differently from a good send
+    check('SENT' in emit and 'REJECTED' in emit,
+          "tx result is honest (REJECTED reads differently from SENT)")
+
+    # ---- 7. FIX 2: staged length initialised to the MAX (never 0) --------
+    check(re.search(r"uint16_t\s+g2_ring_out_len\s*=\s*G2_REPORT_MAX\s*;", src) is not None,
+          "staged notify length initialised to G2_REPORT_MAX (cannot define a zero-length char)")
+
+    # ---- 8. FIX 3: service-creation failure is surfaced -------------------
+    check("svc_error" in src, "model carries a persistent svc_error state")
+    check("g2_ring_set_svc_error" in src, "a helper records the service failure")
+    check(re.search(r'GATT create FAILED', src) is not None,
+          "screen/log says GATT create FAILED when the service was not created")
+
+    # ---- 9. FIX 4b: the attribute-write mask uses the notify-only bit ----
+    check("GATT_NOTIFY_ATTRIBUTE_WRITE" in src,
+          "write chars use GATT_NOTIFY_ATTRIBUTE_WRITE (0x01, notify without a wait)")
+    # the WAIT_FOR_APPL_RESP bit must not be ASSIGNED to any gatt_evt_mask
+    check(not re.search(r"gatt_evt_mask\s*=\s*[^;]*GATT_NOTIFY_WRITE_REQ_AND_WAIT_FOR_APPL_RESP",
+                        src),
+          "the WAIT_FOR_APPL_RESP (0x02) bit is deliberately NOT set")
+
     print()
     print("NOTE: source-level only -- it cannot prove the device works on hardware.")
     print("FAILURES:", FAIL if FAIL else "none")
