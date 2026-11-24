@@ -223,6 +223,11 @@ typedef struct G2RingApp G2RingApp;
 
 typedef struct {
     char adv_name[20];
+    /* The Flipper's OWN BLE address in human order ("AA:BB:CC:DD:EE:FF") -- the
+     * address the glasses must be told to dial. Shown on screen and logged at
+     * startup so the user can read it off the Flipper and pass it to
+     * tools/ring_introduce.py without a separate BLE scanner. */
+    char ble_mac[18];
     uint16_t cccd_legacy;
     uint16_t cccd_health;
     bool central_connected;
@@ -792,8 +797,13 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
     G2RingApp* app = params;
     memset(cfg, 0, sizeof(GapConfig));
 
-    cfg->adv_service.UUID_Type = UUID_TYPE_128BIT;
-    memcpy(cfg->adv_service.Service_UUID_128, r1_uuid_service, sizeof(r1_uuid_service));
+    /* Advertising budget is 31 bytes: flags(3) + name AD(2+14) + 128-bit UUID AD(18)
+     * = 37 overflowed it, so the radio refused set_discoverable and nothing was ever on
+     * air (Windows/phone scans saw no Flipper while the G2 arms showed up). Advertise the
+     * 16-bit Battery service instead (3+16+4 = 23 bytes); the bae80001 service is still
+     * hosted in GATT and found by discovery after connect. */
+    cfg->adv_service.UUID_Type = UUID_TYPE_16;
+    cfg->adv_service.Service_UUID_16 = 0x180F;
 
     const uint8_t* mac = furi_hal_version_get_ble_mac();
     uint8_t human[6];
@@ -806,7 +816,19 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
 
     static char name[FURI_HAL_VERSION_DEVICE_NAME_LENGTH];
     snprintf(name, sizeof(name), "EVEN R1_%02X%02X%02X", human[3], human[4], human[5]);
-    strncpy(cfg->adv_name, name, sizeof(cfg->adv_name) - 1);
+
+    /* The Flipper's own BLE address in human order -- exactly the address
+     * tools/ring_introduce.py hands the glasses as the ring MAC. Built from the
+     * SAME `human` array as the advertised name tail, so they cannot disagree. */
+    static char mac_str[18];
+    snprintf(
+        mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+        human[0], human[1], human[2], human[3], human[4], human[5]);
+    /* Firmware convention (furi_hal_version device_name, serial profile): adv_name[0] is
+     * the AD type byte, then the text. gap passes strlen(adv_name) bytes straight in as
+     * the Local Name AD, so without the 0x09 prefix the AD type was 'E' (0x45). */
+    cfg->adv_name[0] = AD_TYPE_COMPLETE_LOCAL_NAME;
+    strncpy(&cfg->adv_name[1], name, sizeof(cfg->adv_name) - 2);
     cfg->adv_name[sizeof(cfg->adv_name) - 1] = '\0';
 
     cfg->bonding_mode = true;
@@ -839,10 +861,13 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
     if(app) {
         with_view_model(
             app->view, G2RingModel * m,
-            { snprintf(m->adv_name, sizeof(m->adv_name), "%s", name); },
+            { snprintf(m->adv_name, sizeof(m->adv_name), "%s", name);
+              snprintf(m->ble_mac, sizeof(m->ble_mac), "%s", mac_str); },
             true);
     }
     FURI_LOG_I(TAG, "advertising as '%s'", name);
+    /* STARTUP LOG (serial): the ring's own BLE address, readable without a scanner. */
+    FURI_LOG_I(TAG, "BLE MAC %s (ring address for tools/ring_introduce.py)", mac_str);
 }
 
 static const FuriHalBleProfileTemplate g2_ring_profile_template = {
@@ -931,11 +956,15 @@ static void g2_ring_draw_callback(Canvas* canvas, void* ctx) {
      * subscription can be matched against an incoming ATT write by eye. */
     snprintf(buf, sizeof(buf), "ccd nl%02X nh%02X", m->cccd_legacy, m->cccd_health);
     canvas_draw_str(canvas, 2, 37, buf);
+    /* THE FLIPPER'S OWN ADDRESS: the value the user reads off the screen and passes
+     * to tools/ring_introduce.py as the ring MAC, in human order (as a phone shows
+     * it). Always visible so no separate BLE scanner app is needed. */
+    canvas_draw_str(canvas, 2, 44, m->ble_mac[0] ? m->ble_mac : "mac (unknown)");
 
-    uint8_t n = m->count < 4 ? m->count : 4;
+    uint8_t n = m->count < 3 ? m->count : 3;
     for(uint8_t i = 0; i < n; i++) {
         uint8_t idx = (uint8_t)((m->head - n + i + LOG_LINES) % LOG_LINES);
-        canvas_draw_str(canvas, 2, (int32_t)(44 + i * 6), m->lines[idx]);
+        canvas_draw_str(canvas, 2, (int32_t)(50 + i * 6), m->lines[idx]);
     }
 }
 
@@ -1086,6 +1115,21 @@ int32_t g2_ring_app(void* p) {
         g2_ring_log(app, "! GATT create FAILED");
     } else {
         g2_ring_log(app, "! advertising as R1");
+        /* STARTUP LOG (screen): the Flipper's own BLE address, the ring MAC the user
+         * passes to tools/ring_introduce.py. Set by g2_ring_get_gap_config(), which
+         * has already run inside bt_profile_start() above. */
+        char macline[LOG_LINE_LEN];
+        bool have_mac = false;
+        with_view_model(
+            app->view, G2RingModel * m,
+            {
+                if(m->ble_mac[0]) {
+                    snprintf(macline, sizeof(macline), "mac %s", m->ble_mac);
+                    have_mac = true;
+                }
+            },
+            false);
+        if(have_mac) g2_ring_log(app, macline);
     }
 
     view_dispatcher_run(app->view_dispatcher);

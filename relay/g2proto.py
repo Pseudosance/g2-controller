@@ -327,3 +327,25 @@ def pb_encode(fields):
 
 def frame(payload, seq, sid, flag, mtu=255):
     return frames(payload, seq=seq, sid=sid, flag=flag, chunk=mtu)[0]
+
+
+# RING_CONNECT_INFO: DevCfgDataPackage{1: cmd=6, 2: magic, 5: RingInfo{1: connect, 2: mac[6]}}
+# on sid 0x80 (DEVICE_SETTINGS), flag 0x00. Layout from MentraOS G2.kt
+# DevSettingsProto.ringConnectInfo (sent to the RIGHT arm). connect is written
+# explicitly even when false, as MentraOS's writeBoolField does. mac is display order
+# ("AA:BB:CC:DD:EE:FF" -> aa bb cc dd ee ff), same as MentraOS's parse of the string.
+RING_CONNECT_INFO = 6
+
+
+def parse_mac(s: str) -> bytes:
+    parts = s.replace("-", ":").split(":")
+    if len(parts) != 6:
+        raise ValueError(f"bad MAC {s!r}")
+    return bytes(int(p, 16) for p in parts)
+
+
+def msg_ring_connect_info(magic: int, connect: bool, mac: bytes) -> bytes:
+    if len(mac) != 6:
+        raise ValueError("mac must be 6 bytes")
+    ring = bytes([0x08, 1 if connect else 0, 0x12, 6]) + mac
+    return PB().uint(1, RING_CONNECT_INFO).uint(2, magic).b + bytes([0x2A, len(ring)]) + ring
