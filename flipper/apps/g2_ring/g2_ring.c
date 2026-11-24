@@ -769,11 +769,25 @@ static void g2_ring_profile_stop(FuriHalBleProfileBase* base) {
     free(profile);
 }
 
-/* Advertise as a real ring: name "EVEN R1_<hex6>", where hex6 is the last three
- * octets of the human-order BLE MAC. furi_hal_version_get_ble_mac() returns the
- * 6 address bytes in wire (little-endian) order, so the human-order tail is
- * mac[2] mac[1] mac[0]. The name field holds 17 visible chars; "EVEN R1_XXXXXX"
- * is 14. */
+/* Advertise as a real ring.
+ *
+ * The advertised NAME tail and the manufacturer-data MAC are built from ONE array
+ * (`human`), so they can never disagree -- a peer that maps name<->address (e.g.
+ * MentraOS) rejects a device whose advertised MAC does not end in the name's tail.
+ *
+ * Manufacturer-data structure (from the community + MentraOS R1.kt/R1.swift):
+ *   [company id, 2 bytes][public MAC, 6 bytes, human order]
+ * gap_init() emits cfg->mfg_data verbatim as the scan response's sole Manufacturer
+ * Specific Data AD structure: length byte = mfg_data_len+1, type 0xFF, then the bytes
+ * (verified in firmware.elf: gap_init reads cfg+43 mfg_data_len, cfg+20 mfg_data, and
+ * gap_advertise_start passes them to hci_le_set_scan_response_data). The 2-byte
+ * company id 0x45 0x52 ("ER" little-endian) is UNCONFIRMED against a real ring.
+ *
+ * The MAC is emitted in HUMAN order = reverse of the wire (little-endian) order that
+ * furi_hal_version_get_ble_mac() returns and that gap_init writes verbatim into
+ * CONFIG_DATA_PUBADDR. The name is "EVEN R1_" + the LAST THREE octets of that same
+ * human-order MAC. (The exact on-air byte order of get_ble_mac() is NOT provable from
+ * the headers; see the flagged risk in the report.) */
 static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams params) {
     G2RingApp* app = params;
     memset(cfg, 0, sizeof(GapConfig));
@@ -782,8 +796,16 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
     memcpy(cfg->adv_service.Service_UUID_128, r1_uuid_service, sizeof(r1_uuid_service));
 
     const uint8_t* mac = furi_hal_version_get_ble_mac();
+    uint8_t human[6];
+    for(size_t i = 0; i < 6; i++) human[i] = mac[5 - i];
+
+    cfg->mfg_data[0] = 0x45; /* company id low  (UNCONFIRMED) */
+    cfg->mfg_data[1] = 0x52; /* company id high ("ER" little-endian) */
+    memcpy(&cfg->mfg_data[2], human, sizeof(human));
+    cfg->mfg_data_len = 8;
+
     static char name[FURI_HAL_VERSION_DEVICE_NAME_LENGTH];
-    snprintf(name, sizeof(name), "EVEN R1_%02X%02X%02X", mac[2], mac[1], mac[0]);
+    snprintf(name, sizeof(name), "EVEN R1_%02X%02X%02X", human[3], human[4], human[5]);
     strncpy(cfg->adv_name, name, sizeof(cfg->adv_name) - 1);
     cfg->adv_name[sizeof(cfg->adv_name) - 1] = '\0';
 
