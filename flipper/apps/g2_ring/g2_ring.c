@@ -25,15 +25,15 @@
  * ===========================================================================
  *  Key  (gesture)          TYPE   R1 meaning              emitted?
  *  ---------------------   ----   ---------------------   --------------------
- *  UP    (short)           0x04   scroll-top              yes
- *  DOWN  (short)           0x05   scroll-bottom           yes
- *  OK    (short)           0x01   tap                     yes (DEFERRED, below)
- *  OK    (double)          0x02   double-tap              yes
+ *  SIDEWAYS LAYOUT: hold the Flipper with the RIGHT key on top.
+ *  RIGHT (short)           0x04   scroll-top              yes
+ *  LEFT  (short)           0x05   scroll-bottom           yes
+ *  UP    (short)           0x02   double-tap (back)       yes
+ *  DOWN  (short)           0x01   tap (select)            yes
+ *  OK    (short)           00,08  hold + release (menu) yes (ring long-press = Menu)
  *  OK    (long)            0x00   long-press              yes (on Long event)
  *  OK    (release after    0x08   long-press-release      yes (on Release)
  *         a long press)
- *  LEFT  (short)           --     not a ring gesture       LOCAL UI: clear log
- *  RIGHT (short)           --     not a ring gesture       UNMAPPED (documented)
  *  BACK                    --     not a ring gesture       exit the app
  * ===========================================================================
  *
@@ -104,6 +104,15 @@
 
 #define TAG "G2Ring"
 
+/* Glasses-direct mode (2026-11-24): host ONLY bae80010/bae80011. The G2 discovers
+ * bae80010, bae80011 and bae80011's CCCD (openCFW g2_ring_disc_char_list); with the
+ * phone-role pair present it wrote its CCCD enable to handle 19 (bae80012's value)
+ * instead of 17, so the subscription never reached the stack. 0 = also host the
+ * phone-role pair bae80012/bae80013 for the Even app path. */
+#ifndef G2_GLASSES_ONLY
+#define G2_GLASSES_ONLY 1
+#endif
+
 /* ---- gesture TYPE bytes (the ring's real vocabulary) -------------------- */
 #define GESTURE_LONG_PRESS         0x00
 #define GESTURE_TAP                0x01
@@ -114,6 +123,8 @@
 
 /* Deferred single-tap window (the one knob for tap feel). */
 #define DOUBLE_TAP_WINDOW_MS 250
+/* OK = menu: hold, then release after MENU_HOLD_MS. */
+#define MENU_HOLD_MS        800
 /* The receiving side suppresses a report whose TICK advanced by < 100 ms, so we
  * must never fire two reports closer than this. */
 #define G2_MIN_REPORT_GAP_MS 100
@@ -137,6 +148,7 @@ static const uint8_t r1_uuid_write_legacy[16] = R1_UUID(0x10);   /* bae80010 */
 static const uint8_t r1_uuid_notify_legacy[16] = R1_UUID(0x11);  /* bae80011 */
 static const uint8_t r1_uuid_write_health[16] = R1_UUID(0x12);   /* bae80012 */
 static const uint8_t r1_uuid_notify_health[16] = R1_UUID(0x13);  /* bae80013 */
+static const uint8_t r1_uuid_pad[16] = R1_UUID(0xF0);            /* bae800f0: handle pad */
 
 /* GATT property / type / access bit flags.
  *
@@ -211,7 +223,7 @@ static uint8_t g2_ring_out_buf[G2_REPORT_MAX];
 static uint16_t g2_ring_out_len = G2_REPORT_MAX;
 
 /* Static scratch backing the (fixed-data) write characteristics. */
-static uint8_t g2_ring_write_scratch[20];
+static uint8_t g2_ring_write_scratch[64]; /* advStart is 29 bytes */
 
 /* ---- app + model ------------------------------------------------------- */
 
@@ -254,11 +266,13 @@ typedef struct {
     uint16_t cccd_legacy;
     uint16_t cccd_health;
 
+    BleGattCharacteristicParams p_pad;
     BleGattCharacteristicParams p_write_legacy;
     BleGattCharacteristicParams p_notify_legacy;
     BleGattCharacteristicParams p_write_health;
     BleGattCharacteristicParams p_notify_health;
 
+    BleGattCharacteristicInstance ch_pad;
     BleGattCharacteristicInstance ch_write_legacy;
     BleGattCharacteristicInstance ch_notify_legacy;
     BleGattCharacteristicInstance ch_write_health;
@@ -279,6 +293,7 @@ struct G2RingApp {
 
     G2RingProfile* profile;   /* set by profile start, cleared by profile stop */
     bool ok_tap_pending;      /* deferred single tap armed (GUI thread only) */
+    uint8_t menu_step;        /* OK macro: 1 = hold next, 2 = release next */
     bool ok_long_active;      /* a long press is in progress (GUI thread only) */
     uint32_t last_report_ms;
 
@@ -294,6 +309,7 @@ struct G2RingApp {
 enum {
     G2RingEventDeferredTap = 1,
     G2RingEventSendBattery,
+    G2RingEventSendRsp,
 };
 
 /* Forward declaration: start() references the template, the template references
@@ -410,7 +426,7 @@ static void g2_ring_emit(G2RingApp* app, uint8_t type, const char* tag) {
          * its header), so stage the 11-byte length on EVERY emission or the
          * glasses would receive the 33-byte max. */
         g2_ring_out_len = G2_REPORT_LEN;
-        bool sent = ble_gatt_characteristic_update(
+        bool sent = !ble_gatt_characteristic_update(
             profile->svc_handle, &profile->ch_notify_legacy, g2_ring_out_buf);
         if(sent) app->last_report_ms = now; /* only a real send arms the gap */
         furi_mutex_release(app->mutex);
@@ -439,7 +455,7 @@ static void g2_ring_send_battery(G2RingApp* app) {
         g2_ring_out_buf[4] = 0x64; /* 100% */
         g2_ring_out_buf[5] = 0x00; /* not charging */
         g2_ring_out_len = 6;
-        sent = ble_gatt_characteristic_update(
+        sent = !ble_gatt_characteristic_update(
             profile->svc_handle, &profile->ch_notify_legacy, g2_ring_out_buf);
         app->last_report_ms = g2_ring_now_ms();
     }
@@ -449,21 +465,115 @@ static void g2_ring_send_battery(G2RingApp* app) {
 
 /* ---- deferred single tap (GUI thread) ---------------------------------- */
 
-static void g2_ring_ok_short(G2RingApp* app) {
-    if(app->ok_tap_pending) {
-        furi_timer_stop(app->tap_timer);
-        app->ok_tap_pending = false;
-        g2_ring_emit(app, GESTURE_DOUBLE_TAP, "double-tap");
-        return;
-    }
-    app->ok_tap_pending = true;
-    furi_timer_start(app->tap_timer, furi_ms_to_ticks(DOUBLE_TAP_WINDOW_MS));
-}
-
 static void g2_ring_tap_timer_callback(void* context) {
     G2RingApp* app = context;
     /* FuriTimer thread: never touch the GUI/model here -- post an event. */
     view_dispatcher_send_custom_event(app->view_dispatcher, G2RingEventDeferredTap);
+}
+
+/* ---- R1 model-frame replies (built on BLE thread, sent on GUI thread) --- */
+
+static uint32_t g2_ring_crc32c(const uint8_t* d, size_t n) {
+    /* faceclaw RingProtocol.crc32: poly 0x1EDC6F41, MSB-first, init 0, no xorout. */
+    uint32_t crc = 0;
+    for(size_t i = 0; i < n; i++) {
+        crc ^= (uint32_t)d[i] << 24;
+        for(int b = 0; b < 8; b++) crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x1EDC6F41u : (crc << 1);
+    }
+    return crc;
+}
+
+#define RSP_Q 8
+#define RSP_MAX 24
+static uint8_t g2_ring_rsp_q[RSP_Q][RSP_MAX];
+static uint8_t g2_ring_rsp_len[RSP_Q];
+static uint8_t g2_ring_rsp_legacy[RSP_Q]; /* 1 = send on bae80011, 0 = bae80013 */
+static volatile uint8_t g2_ring_rsp_head, g2_ring_rsp_tail;
+
+static uint16_t g2_ring_modbus(const uint8_t* m, size_t n) {
+    /* openR1 firmware_checksum: CRC-16/MODBUS over the whole model with the
+     * checksum bytes (model offsets 10,11) taken as zero. */
+    uint16_t crc = 0xFFFF;
+    for(size_t i = 0; i < n; i++) {
+        crc ^= (i == 10 || i == 11) ? 0 : m[i];
+        for(int b = 0; b < 8; b++) crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
+    }
+    return crc;
+}
+
+/* Ring -> phone reply, exactly as the decompiled R1 firmware builds it
+ * (openCFW r1/src/r1_dispatch.c add_response + r1_protocol.c r1_model_encode +
+ * r1_fragment_message, commit 832137ec):
+ *   fragment: [0]=0 (last fragment) [1..4]=CRC-32C(model) LE
+ *   model:    64 <module> 64 <serial LE16 = request serial> <status = 0x03|code<<2>
+ *             <cmd> <subcmd> <len LE16 = 12 + payload> <CRC-16/MODBUS LE16> <payload>
+ * Our 15-byte "header" is fragment(5) + model header(12)-2... i.e. model starts at 5. */
+static void g2_ring_queue_frame(
+    G2RingApp* app, uint8_t status, uint8_t module, const uint8_t serial[2],
+    uint8_t cmd, uint8_t sub, const uint8_t* payload, size_t plen) {
+    uint8_t next = (uint8_t)((g2_ring_rsp_head + 1) % RSP_Q);
+    if(next == g2_ring_rsp_tail) {
+        FURI_LOG_W(TAG, "rsp queue full");
+        return;
+    }
+    if(plen > RSP_MAX - 17) plen = RSP_MAX - 17;
+    uint8_t* f = g2_ring_rsp_q[g2_ring_rsp_head];
+    memset(f, 0, RSP_MAX);
+    uint8_t* m = &f[5];
+    size_t mlen = 12 + plen;
+    m[0] = 0x64; m[1] = module; m[2] = 0x64; m[3] = serial[0]; m[4] = serial[1];
+    m[5] = status; m[6] = cmd; m[7] = sub;
+    m[8] = (uint8_t)mlen; m[9] = (uint8_t)(mlen >> 8);
+    if(plen) memcpy(&m[12], payload, plen);
+    uint16_t ck = g2_ring_modbus(m, mlen);
+    m[10] = (uint8_t)ck; m[11] = (uint8_t)(ck >> 8);
+    uint32_t c = g2_ring_crc32c(m, mlen);
+    f[0] = 0; f[1] = (uint8_t)c; f[2] = (uint8_t)(c >> 8); f[3] = (uint8_t)(c >> 16); f[4] = (uint8_t)(c >> 24);
+    g2_ring_rsp_len[g2_ring_rsp_head] = (uint8_t)(5 + mlen);
+    g2_ring_rsp_legacy[g2_ring_rsp_head] = 0;
+    g2_ring_rsp_head = next;
+    view_dispatcher_send_custom_event(app->view_dispatcher, G2RingEventSendRsp);
+}
+
+/* Queue a raw legacy-channel frame (ring -> glasses, notified on bae80011). */
+static void g2_ring_queue_legacy(G2RingApp* app, const uint8_t* frame, size_t len) {
+    uint8_t next = (uint8_t)((g2_ring_rsp_head + 1) % RSP_Q);
+    if(next == g2_ring_rsp_tail || len > RSP_MAX) {
+        FURI_LOG_W(TAG, "legacy queue full/too long");
+        return;
+    }
+    memset(g2_ring_rsp_q[g2_ring_rsp_head], 0, RSP_MAX);
+    memcpy(g2_ring_rsp_q[g2_ring_rsp_head], frame, len);
+    g2_ring_rsp_len[g2_ring_rsp_head] = (uint8_t)len;
+    g2_ring_rsp_legacy[g2_ring_rsp_head] = 1;
+    g2_ring_rsp_head = next;
+    view_dispatcher_send_custom_event(app->view_dispatcher, G2RingEventSendRsp);
+}
+
+/* GUI thread: drain queued replies as notifications on bae80013. */
+static void g2_ring_send_rsps(G2RingApp* app) {
+    while(g2_ring_rsp_tail != g2_ring_rsp_head) {
+        uint8_t i = g2_ring_rsp_tail;
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        G2RingProfile* profile = app->profile;
+        bool sent = false;
+        if(profile && app->svc_ok && app->central_connected) {
+            memcpy(g2_ring_out_buf, g2_ring_rsp_q[i], g2_ring_rsp_len[i]);
+            g2_ring_out_len = g2_ring_rsp_len[i];
+            sent = ble_gatt_characteristic_update(
+                profile->svc_handle,
+                g2_ring_rsp_legacy[i] ? &profile->ch_notify_legacy : &profile->ch_notify_health,
+                g2_ring_out_buf);
+        }
+        furi_mutex_release(app->mutex);
+        static char hx[2 * RSP_MAX + 1];
+        hexify(hx, sizeof(hx), g2_ring_rsp_q[i], g2_ring_rsp_len[i]);
+        FURI_LOG_I(TAG, "TX k%02X ret=%d %s", g2_ring_rsp_q[i][10], sent, hx);
+        static char line[LOG_LINE_LEN];
+        snprintf(line, sizeof(line), "> rsp %02X%02X %s", g2_ring_rsp_q[i][11], g2_ring_rsp_q[i][12], sent ? "ok" : "FAIL");
+        g2_ring_log(app, line);
+        g2_ring_rsp_tail = (uint8_t)((i + 1) % RSP_Q);
+    }
 }
 
 /* ---- incoming BLE traffic (BLE thread) --------------------------------- */
@@ -477,6 +587,11 @@ static void
     static char hex[27]; /* up to 12 bytes -> 24 chars + NUL */
     static char line[64];
     hexify(hex, sizeof(hex), val, vlen > 12 ? 12 : vlen);
+    {
+        static char full[2 * 64 + 1];
+        hexify(full, sizeof(full), val, vlen > 64 ? 64 : vlen);
+        FURI_LOG_I(TAG, "WR h=%u len=%u %s", handle, (unsigned)vlen, full);
+    }
 
     /* (a) A write to the legacy notify CCCD (bae80011's 0x2902) means this link
      * has taken the ring's GLASSES role. That is where gestures go. On the
@@ -497,32 +612,69 @@ static void
         return;
     }
 
-    if(handle == profile->ch_write_legacy.handle ||
-       handle == profile->ch_write_health.handle) {
+    /* Attr_Handle in ACI_GATT_ATTRIBUTE_MODIFIED is the VALUE handle = decl + 1
+     * (ble_svc_serial compares against chars[Rx].handle + 1). */
+    if(handle == profile->ch_write_legacy.handle + 1 ||
+       handle == profile->ch_write_health.handle + 1) {
         /* (b) Legacy pair-auth bytes written raw on bae80010: accept them. */
+        /* Legacy glasses commands on bae80010 (opcode at byte 2). Replies per the
+         * G2's own parser RING_CmdPackageParse (openCFW display_ring_send_packet.c):
+         * 0x85 -> ring echoes 85 with [3]=1,[4]=1 ("ring touch enable ok"), which
+         * makes the glasses publish the ring link ready; 0x88 pair-auth -> battery
+         * report 00 09 8B 00 <pct> <chg> (faceclaw: the ring's accept answer). */
+        if(handle == profile->ch_write_legacy.handle + 1 && vlen >= 3) {
+            if(val[2] == 0x85) {
+                static const uint8_t touch_ok[] = {0x00, 0x09, 0x85, 0x01, 0x01, 0x00, 0x00, 0x00};
+                g2_ring_queue_legacy(app, touch_ok, sizeof(touch_ok));
+                /* Report the ring as worn (RING_CmdWearStatus 0x8C, [4]=1). */
+                static const uint8_t worn[] = {0x00, 0x09, 0x8C, 0x00, 0x01, 0x00};
+                g2_ring_queue_legacy(app, worn, sizeof(worn));
+                g2_ring_set_touch(app);
+                g2_ring_log(app, "! 85 touch-enable -> ok");
+                return;
+            }
+            if(val[2] == 0x89) {
+                /* The glasses repeat 0x89 every 2.5 s and drop the link after three
+                 * misses. Answer with the ring heartbeat 0x94 ([4] not 0x20/0x40 ->
+                 * "RING_GlassesHeartbeat recv ok" in RING_CmdPackageParse). */
+                static const uint8_t hb[] = {0x00, 0x09, 0x94, 0x00, 0x00, 0x00, 0x00, 0x00};
+                g2_ring_queue_legacy(app, hb, sizeof(hb));
+                return;
+            }
+            if(val[2] == 0x88) {
+                static const uint8_t bat[] = {0x00, 0x09, 0x8B, 0x00, 0x64, 0x00};
+                g2_ring_queue_legacy(app, bat, sizeof(bat));
+            }
+        }
         if(vlen == 4 && val[0] == 0x00 && val[1] == 0x35 && val[2] == 0x88 && val[3] == 0x00) {
             g2_ring_set_pair_auth(app);
             g2_ring_log(app, "! pairAuth 00358800");
             return;
         }
-        /* (c) R1 frame: FLAG(1) CRC32(4) 0x64 CHAN 0x64 SEQ 0x00 KIND CMD_HI
-         * CMD_LO PLEN(2) ... -- 5 and 7 are the two 0x64 markers. */
-        if(vlen >= 11 && val[5] == 0x64 && val[7] == 0x64) {
-            uint8_t cmd_hi = val[9];
-            uint8_t cmd_lo = val[10];
+        /* (c) R1 model frame (faceclaw RingProtocol.kt): FLAG(0) CRC32C_LE(1..4)
+         * 0x64(5) CHAN(6) 0x64(7) SEQ(8) 0x00(9) KIND(10) CMD_HI(11) CMD_LO(12)
+         * PLEN_LE(13..14) PAYLOAD(15..): payload[0..1] = checksum/nonce, then args.
+         * (Earlier builds read CMD from 9/10 -- wrong.) */
+        if(vlen >= 15 && val[5] == 0x64 && val[7] == 0x64) {
+            uint8_t chan = val[6], seq = val[8], kind = val[10];
+            uint8_t cmd_hi = val[11], cmd_lo = val[12];
             if(cmd_hi == 0x00 && cmd_lo == 0x08) {
                 g2_ring_set_pair_auth(app);
-                snprintf(line, sizeof(line), "! frame pairAuth");
-            } else if(cmd_hi == 0x00 && cmd_lo == 0x07) {
-                bool on = (vlen >= 15) ? (val[14] != 0) : true;
-                if(on) g2_ring_set_touch(app);
-                snprintf(line, sizeof(line), "! touchSwitch %s", on ? "open" : "close");
-            } else if(cmd_hi == 0x00 && cmd_lo == 0x0A) {
-                snprintf(line, sizeof(line), "! frame advStart");
-            } else {
-                snprintf(line, sizeof(line), "! frame %02X%02X", cmd_hi, cmd_lo);
+            } else if(cmd_hi == 0x00 && cmd_lo == 0x07 && vlen >= 19 && val[17] == 2) {
+                if(val[18]) g2_ring_set_touch(app);
             }
+            snprintf(line, sizeof(line), "< c%u k%u %02X%02X s%u", chan, kind, cmd_hi, cmd_lo, seq);
             g2_ring_log(app, line);
+            /* Answer REQ (0) and DATA/SET (2) with an "ok" RSP (kind 0x03) on the
+             * same chan/seq/cmd, echoing the 2-byte nonce, like a real ring does
+             * per faceclaw's model. ACKs (1) get no answer. */
+            /* Answer requests (status bit0 == 0) like r1_dispatch does: success
+             * (0x03); pairAuth (0x08) carries result byte 0; others no payload. */
+            if((kind & 0x01) == 0) {
+                static const uint8_t ok0[] = {0x00};
+                bool pair = (cmd_hi == 0x00 && cmd_lo == 0x08);
+                g2_ring_queue_frame(app, 0x03, chan, &val[8], cmd_hi, cmd_lo, pair ? ok0 : NULL, pair ? 1 : 0);
+            }
             return;
         }
         snprintf(line, sizeof(line), "< wr %04X %s", handle, hex);
@@ -536,40 +688,36 @@ static void
 /* HCI UART packet: type(1) then type-specific header. ACL data (0x02):
  * handle(2) len(2) L2CAP{ len(2) cid(2) ATT{ op(1) handle(2) value.. } }. */
 static void g2_ring_on_ble_event(G2RingApp* app, G2RingProfile* profile, const uint8_t* pkt) {
-    uint8_t type = pkt[0];
-    size_t total;
-    if(type == 0x02) {
-        total = 5u + ((size_t)pkt[3] | ((size_t)pkt[4] << 8));
-    } else if(type == 0x01 || type == 0x04) {
-        total = 3u + pkt[2];
-    } else {
-        total = 1u;
+    /* The dispatcher hands us an hci_uart_pckt, exactly as ble_svc_serial's handler
+     * reads it: type(0x04 event) | hci_event_pckt{evt, plen, data}. GATT writes arrive
+     * as evt 0xFF (vendor) with ecode 0x0C01 (ACI_GATT_ATTRIBUTE_MODIFIED), whose
+     * rp0 is Connection_Handle(2) Attr_Handle(2) Offset(2) Attr_Data_Length(2) Data.
+     * (Earlier builds parsed ACL packets, type 0x02, which never reach this hook, so
+     * every write -- including the app's pairAuth -- was silently dropped.) */
+    if(pkt[0] != 0x04) return;
+    /* Track the link from raw HCI events: the bt-service status callback did not
+     * report the glasses' connection (screen said "! no link" while connected). */
+    if(pkt[1] == 0x05) { /* Disconnection Complete */
+        FURI_LOG_I(TAG, "HCI disconnect reason %02X", pkt[6]);
+        g2_ring_set_link(app, false);
+        g2_ring_set_glasses(app, false);
+        return;
     }
-    if(total > 64u) total = 64u;
-
-    /* Always log the raw frame so a hardware run is diagnosable even if the
-     * interpretive parse below turns out to be wrong. */
-    {
-        static char hex[27]; /* up to 13 bytes -> 26 chars + NUL */
-        hexify(hex, sizeof(hex), pkt, total > 13 ? 13 : total);
-        static char line[64];
-        snprintf(line, sizeof(line), "< t%02X %s", type, hex);
-        g2_ring_log(app, line);
+    if(pkt[1] == 0x3E && (pkt[3] == 0x01 || pkt[3] == 0x0A)) { /* LE (Enhanced) Conn Complete */
+        FURI_LOG_I(TAG, "HCI LE connect status %02X peer %02X:%02X:%02X:%02X:%02X:%02X", pkt[4],
+                   pkt[13], pkt[12], pkt[11], pkt[10], pkt[9], pkt[8]);
+        if(pkt[4] == 0x00) g2_ring_set_link(app, true);
+        return;
     }
-
-    if(type != 0x02) return; /* only ACL data carries ATT PDUs */
-    if(total < 12u) return;
-
-    uint16_t cid = (uint16_t)(pkt[7] | ((uint16_t)pkt[8] << 8));
-    if(cid != 0x0004u) return; /* ATT fixed channel */
-
-    uint8_t op = pkt[9];
-    if(op != 0x12u && op != 0x52u) return; /* Write Request / Write Command */
-
-    uint16_t handle = (uint16_t)(pkt[10] | ((uint16_t)pkt[11] << 8));
-    const uint8_t* val = &pkt[12];
-    size_t vlen = total - 12u;
-    g2_ring_handle_write(app, profile, handle, val, vlen);
+    if(pkt[1] != 0xFF) return;
+    uint16_t ecode = (uint16_t)(pkt[3] | ((uint16_t)pkt[4] << 8));
+    if(ecode != 0x0C01u) return;
+    uint16_t handle = (uint16_t)(pkt[7] | ((uint16_t)pkt[8] << 8));
+    uint16_t vlen = (uint16_t)(pkt[11] | ((uint16_t)pkt[12] << 8));
+    if(vlen > 244) vlen = 244;
+    /* attribute-modified reports the CHARACTERISTIC handle (decl); the value
+     * handle is decl+1 for the ST stack. Accept either. */
+    g2_ring_handle_write(app, profile, handle, &pkt[13], vlen);
 }
 
 static BleEventAckStatus g2_ring_svc_event_cb(void* event, void* context) {
@@ -577,8 +725,11 @@ static BleEventAckStatus g2_ring_svc_event_cb(void* event, void* context) {
     if(profile && profile->app) {
         g2_ring_on_ble_event(profile->app, profile, (const uint8_t*)event);
     }
-    /* Observation only: let the stack do its normal thing with the packet. */
-    return BleEventAckFlowEnable;
+    /* Observation only. BleEventNotAck = "not handled, keep dispatching". Returning
+     * BleEventAckFlowEnable claimed EVERY event as handled, so gap.c never saw the SMP
+     * pairing events: the phone hit SMP_RSP_TIMEOUT and the Flipper log showed no
+     * pairing activity at all (hardware run 2026-11-24). */
+    return BleEventNotAck;
 }
 
 /* ---- chartacteristic setup + profile lifecycle ------------------------- */
@@ -659,20 +810,29 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
      * descriptor branch when descriptor_params != NULL and calls the descriptor's
      * data_callback.fn unconditionally, which we left NULL -- that indirect call
      * is the MemManage fault we hit on hardware. NULL skips that branch entirely. */
+    g2_ring_fill_char(&profile->p_pad, "r1_pad", r1_uuid_pad, GATT_PROP_WRITE_ANY, NULL);
     g2_ring_fill_char(&profile->p_write_legacy, "r1_write_legacy", r1_uuid_write_legacy, GATT_PROP_WRITE_ANY, NULL);
     g2_ring_fill_char(&profile->p_notify_legacy, "r1_notify_legacy", r1_uuid_notify_legacy, GATT_PROP_NOTIFY, NULL);
     g2_ring_fill_char(&profile->p_write_health, "r1_write_health", r1_uuid_write_health, GATT_PROP_WRITE_ANY, NULL);
     g2_ring_fill_char(&profile->p_notify_health, "r1_notify_health", r1_uuid_notify_health, GATT_PROP_NOTIFY, NULL);
 
+    /* Handle pad (2026-11-24): the G2 cached the ring's handles from its first
+     * discovery (it keeps writing its CCCD enable to handle 19 and does not
+     * rediscover). A 2-handle placeholder first shifts bae80010 to 15/16 and
+     * bae80011 to 17/18 with its CCCD at 19, where the glasses write. */
+    if(G2_GLASSES_ONLY) ble_gatt_characteristic_init(profile->svc_handle, &profile->p_pad, &profile->ch_pad);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_write_legacy, &profile->ch_write_legacy);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_notify_legacy, &profile->ch_notify_legacy);
+#if !G2_GLASSES_ONLY
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_write_health, &profile->ch_write_health);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_notify_health, &profile->ch_notify_health);
+#endif
 
     /* FIX 3: characteristic creation returns void, so detect failure via the
      * resulting handles. A zero handle means the attribute was not created. */
     if(profile->ch_write_legacy.handle == 0 || profile->ch_notify_legacy.handle == 0 ||
-       profile->ch_write_health.handle == 0 || profile->ch_notify_health.handle == 0) {
+       (!G2_GLASSES_ONLY &&
+        (profile->ch_write_health.handle == 0 || profile->ch_notify_health.handle == 0))) {
         FURI_LOG_E(TAG, "characteristic init produced a zero handle");
         svc_ok = false;
     }
@@ -687,11 +847,13 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
      * reported descriptor handle if one ever appears, else use value+1. */
     profile->cccd_legacy = profile->ch_notify_legacy.descriptor_handle
                                ? profile->ch_notify_legacy.descriptor_handle
-                               : (uint16_t)(profile->ch_notify_legacy.handle + 1);
+                               : (uint16_t)(profile->ch_notify_legacy.handle + 2); /* decl+1 = value, decl+2 = CCCD (ST stack; ble_svc_serial uses .handle + 2) */
     profile->cccd_health = profile->ch_notify_health.descriptor_handle
                                ? profile->ch_notify_health.descriptor_handle
-                               : (uint16_t)(profile->ch_notify_health.handle + 1);
+                               : (uint16_t)(profile->ch_notify_health.handle + 2);
 
+    FURI_LOG_I(TAG, "layout pad=%u w10=%u n11=%u ccc11=%u", profile->ch_pad.handle,
+               profile->ch_write_legacy.handle, profile->ch_notify_legacy.handle, profile->cccd_legacy);
     profile->svc_handler = ble_event_dispatcher_register_svc_handler(g2_ring_svc_event_cb, profile);
 
     if(app) {
@@ -766,10 +928,13 @@ static void g2_ring_profile_stop(FuriHalBleProfileBase* base) {
     if(profile->svc_handler) {
         ble_event_dispatcher_unregister_svc_handler(profile->svc_handler);
     }
+#if !G2_GLASSES_ONLY
     ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_notify_health);
     ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_write_health);
+#endif
     ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_notify_legacy);
     ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_write_legacy);
+    if(G2_GLASSES_ONLY) ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_pad);
     ble_gatt_service_delete(profile->svc_handle);
     free(profile);
 }
@@ -832,7 +997,7 @@ static void g2_ring_get_gap_config(GapConfig* cfg, FuriHalBleProfileParams param
     cfg->adv_name[sizeof(cfg->adv_name) - 1] = '\0';
 
     cfg->bonding_mode = true;
-    cfg->pairing_method = GapPairingPinCodeShow;
+    cfg->pairing_method = GapPairingNone; /* Just Works: a real R1 has no screen to show a PIN */
 
     /* Fields the shipped ble_profile_serial_get_config sets that a zeroed config
      * does NOT. Disassembled from firmware.elf at 0x0800152d: it memcpy()s the
@@ -974,19 +1139,25 @@ static bool g2_ring_input_callback(InputEvent* event, void* context) {
     switch(event->type) {
     case InputTypeShort:
         switch(event->key) {
-        case InputKeyUp:
+        /* Sideways layout (Flipper held with the RIGHT key on top). */
+        case InputKeyRight:
             g2_ring_emit(app, GESTURE_SCROLL_TOP, "scroll-top");
             return true;
-        case InputKeyDown:
+        case InputKeyLeft:
             g2_ring_emit(app, GESTURE_SCROLL_BOTTOM, "scroll-bot");
             return true;
-        case InputKeyOk:
-            g2_ring_ok_short(app);
+        case InputKeyUp: /* back */
+            g2_ring_emit(app, GESTURE_DOUBLE_TAP, "double-tap");
             return true;
-        case InputKeyLeft: /* local UI: clear the rolling log */
-            with_view_model(app->view, G2RingModel * m, { m->head = 0; m->count = 0; }, true);
+        case InputKeyDown: /* select */
+            g2_ring_emit(app, GESTURE_TAP, "tap");
             return true;
-        case InputKeyRight: /* unmapped: not a ring gesture */
+        case InputKeyOk: /* menu: hold, then release (ring long-press = Menu) */
+            if(app->menu_step == 0) {
+                g2_ring_emit(app, GESTURE_LONG_PRESS, "menu hold");
+                app->menu_step = 2;
+                furi_timer_start(app->tap_timer, furi_ms_to_ticks(MENU_HOLD_MS));
+            }
             return true;
         default:
             break;
@@ -999,6 +1170,7 @@ static bool g2_ring_input_callback(InputEvent* event, void* context) {
             furi_timer_stop(app->tap_timer);
             app->ok_tap_pending = false;
             app->ok_long_active = true;
+            app->menu_step = 0;
             g2_ring_emit(app, GESTURE_LONG_PRESS, "long-press");
             return true;
         }
@@ -1027,10 +1199,21 @@ static uint32_t g2_ring_exit_callback(void* context) {
 static bool g2_ring_custom_event_callback(void* context, uint32_t event) {
     G2RingApp* app = context;
     if(event == G2RingEventDeferredTap) {
-        if(app->ok_tap_pending) { /* still armed -> a real single tap */
+        if(app->menu_step == 1) {
+            g2_ring_emit(app, GESTURE_LONG_PRESS, "menu hold");
+            app->menu_step = 2;
+            furi_timer_start(app->tap_timer, furi_ms_to_ticks(MENU_HOLD_MS));
+        } else if(app->menu_step == 2) {
+            app->menu_step = 0;
+            g2_ring_emit(app, GESTURE_LONG_PRESS_RELEASE, "menu rel");
+        } else if(app->ok_tap_pending) { /* still armed -> a real single tap */
             app->ok_tap_pending = false;
             g2_ring_emit(app, GESTURE_TAP, "tap");
         }
+        return true;
+    }
+    if(event == G2RingEventSendRsp) {
+        g2_ring_send_rsps(app);
         return true;
     }
     if(event == G2RingEventSendBattery) {
