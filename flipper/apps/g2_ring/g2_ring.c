@@ -30,7 +30,7 @@
  *  LEFT  (short)           0x05   scroll-bottom           yes
  *  UP    (short)           0x02   double-tap (back)       yes
  *  DOWN  (short)           0x01   tap (select)            yes
- *  OK    (short)           00,08  hold + release (menu) yes (ring long-press = Menu)
+ *  OK    (short)           09,08  tap-hold + release    yes (opens the menu)
  *  OK    (long)            0x00   long-press              yes (on Long event)
  *  OK    (release after    0x08   long-press-release      yes (on Release)
  *         a long press)
@@ -110,7 +110,7 @@
  * instead of 17, so the subscription never reached the stack. 0 = also host the
  * phone-role pair bae80012/bae80013 for the Even app path. */
 #ifndef G2_GLASSES_ONLY
-#define G2_GLASSES_ONLY 1
+#define G2_GLASSES_ONLY 0
 #endif
 
 /* ---- gesture TYPE bytes (the ring's real vocabulary) -------------------- */
@@ -120,6 +120,9 @@
 #define GESTURE_SCROLL_TOP         0x04
 #define GESTURE_SCROLL_BOTTOM      0x05
 #define GESTURE_LONG_PRESS_RELEASE 0x08
+/* Ring "tap and hold" (fw 2.4.1.4): opens the menu on its own, independent of
+ * the ring long-press shortcut that the Even app resets. Found by probing. */
+#define GESTURE_TAP_HOLD           0x09
 
 /* Deferred single-tap window (the one knob for tap feel). */
 #define DOUBLE_TAP_WINDOW_MS 250
@@ -813,7 +816,7 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
      * and what this four-characteristic service needs, so it was a needless
      * failure/overrun mode. See the API PARAMETERS note at the top of this file. */
     bool svc_add_ok = ble_gatt_service_add(
-        UUID_TYPE_128BIT, &su, GATT_SERVICE_PRIMARY, 12, &profile->svc_handle);
+        UUID_TYPE_128BIT, &su, GATT_SERVICE_PRIMARY, 14, &profile->svc_handle);
     if(!svc_add_ok) {
         FURI_LOG_E(TAG, "ble_gatt_service_add failed");
         svc_ok = false;
@@ -842,7 +845,7 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
      * discovery (it keeps writing its CCCD enable to handle 19 and does not
      * rediscover). A 2-handle placeholder first shifts bae80010 to 15/16 and
      * bae80011 to 17/18 with its CCCD at 19, where the glasses write. */
-    if(G2_GLASSES_ONLY) ble_gatt_characteristic_init(profile->svc_handle, &profile->p_pad, &profile->ch_pad);
+    ble_gatt_characteristic_init(profile->svc_handle, &profile->p_pad, &profile->ch_pad);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_write_legacy, &profile->ch_write_legacy);
     ble_gatt_characteristic_init(profile->svc_handle, &profile->p_notify_legacy, &profile->ch_notify_legacy);
 #if !G2_GLASSES_ONLY
@@ -874,8 +877,11 @@ static FuriHalBleProfileBase* g2_ring_profile_start(FuriHalBleProfileParams para
                                ? profile->ch_notify_health.descriptor_handle
                                : (uint16_t)(profile->ch_notify_health.handle + 2);
 
-    FURI_LOG_I(TAG, "layout pad=%u w10=%u n11=%u ccc11=%u", profile->ch_pad.handle,
-               profile->ch_write_legacy.handle, profile->ch_notify_legacy.handle, profile->cccd_legacy);
+    FURI_LOG_I(TAG, "layout pad=%u w10=%u n11=%u ccc11=%u w12=%u n13=%u ccc13=%u",
+               profile->ch_pad.handle, profile->ch_write_legacy.handle,
+               profile->ch_notify_legacy.handle, profile->cccd_legacy,
+               profile->ch_write_health.handle, profile->ch_notify_health.handle,
+               profile->cccd_health);
     profile->svc_handler = ble_event_dispatcher_register_svc_handler(g2_ring_svc_event_cb, profile);
 
     if(app) {
@@ -956,7 +962,7 @@ static void g2_ring_profile_stop(FuriHalBleProfileBase* base) {
 #endif
     ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_notify_legacy);
     ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_write_legacy);
-    if(G2_GLASSES_ONLY) ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_pad);
+    ble_gatt_characteristic_delete(profile->svc_handle, &profile->ch_pad);
     ble_gatt_service_delete(profile->svc_handle);
     free(profile);
 }
@@ -1174,9 +1180,9 @@ static bool g2_ring_input_callback(InputEvent* event, void* context) {
         case InputKeyDown: /* select */
             g2_ring_emit(app, GESTURE_TAP, "tap");
             return true;
-        case InputKeyOk: /* menu: hold, then release (ring long-press = Menu) */
+        case InputKeyOk: /* menu: ring tap-and-hold, then release */
             if(app->menu_step == 0) {
-                g2_ring_emit(app, GESTURE_LONG_PRESS, "menu hold");
+                g2_ring_emit(app, GESTURE_TAP_HOLD, "menu tap-hold");
                 app->menu_step = 2;
                 furi_timer_start(app->tap_timer, furi_ms_to_ticks(MENU_HOLD_MS));
             }
@@ -1193,7 +1199,7 @@ static bool g2_ring_input_callback(InputEvent* event, void* context) {
             app->ok_tap_pending = false;
             app->ok_long_active = true;
             app->menu_step = 0;
-            g2_ring_emit(app, GESTURE_LONG_PRESS, "long-press");
+            g2_ring_emit(app, GESTURE_TAP_HOLD, "long tap-hold");
             return true;
         }
         break;
@@ -1222,7 +1228,7 @@ static bool g2_ring_custom_event_callback(void* context, uint32_t event) {
     G2RingApp* app = context;
     if(event == G2RingEventDeferredTap) {
         if(app->menu_step == 1) {
-            g2_ring_emit(app, GESTURE_LONG_PRESS, "menu hold");
+            g2_ring_emit(app, GESTURE_TAP_HOLD, "menu tap-hold");
             app->menu_step = 2;
             furi_timer_start(app->tap_timer, furi_ms_to_ticks(MENU_HOLD_MS));
         } else if(app->menu_step == 2) {
