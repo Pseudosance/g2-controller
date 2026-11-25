@@ -11,7 +11,9 @@ architecture below is reachable from a stock Flipper.
 
 ## THE HARD BLOCKER (read before anything else)
 
-A stock Flipper `.fap` **cannot** talk to the glasses directly:
+A stock Flipper `.fap` **cannot** talk to the glasses directly **as a central**
+(the R1 ring emulator sidesteps this by being a peripheral that the glasses dial;
+see "The R1 ring emulator" below):
 
 1. **A stock fap cannot be a BLE central.** It cannot scan for, connect out to, or
    discover services on the G2 — no GATT-client API is exported to apps. Flipper
@@ -113,25 +115,17 @@ command). This is separate from the firmware's own long-press timing.
 
 ---
 
-## Current direction — NOT YET IMPLEMENTED
+## The R1 ring emulator — WORKING (flipper/apps/g2_ring)
 
-Idea: the Even **R1 ring is itself a BLE peripheral**, and the glasses are the BLE
-**centrals** that connect *to* it. If the Flipper could advertise the ring's GATT
-service and reproduce its characteristic behaviour, the glasses would accept the
-Flipper as if it were the ring — no PC relay needed for the ring-gesture path.
+The Flipper can't be a BLE central, but it doesn't need to be: the **R1 ring is a
+peripheral that the glasses dial**. `flipper/apps/g2_ring` advertises as an R1 and
+hosts the ring's GATT service. After a one-time PC introduction, the G2 connects to
+it on its own and accepts scroll, select, back and menu, with the phone and the
+Even app still connected. No relay needed.
 
-The ring's vendor service and characteristic pairs the plan targets (not
-referenced by any code in this repository; treated as the plan, unverified):
-
-    vendor service:        bae80001-4f05-4503-8e65-3af1f7329d1f
-    characteristic pair:   bae80010 / bae80011
-    characteristic pair:   bae80012 / bae80013
-
-**Status: unbuilt.** It is gated on whether a **stock `.fap` can host a
-custom-UUID GATT service** at all. The only GATT API exported to apps is
-server-side (`ble_gatt_*` / `ble_event_dispatcher_*`); whether an app can register
-an arbitrary 128-bit service, and whether the glasses would trust an unbound
-stand-in ring, is unproven. Nothing here is implemented.
+**Read [docs/R1-EMULATION.md](docs/R1-EMULATION.md)**: protocol, GATT layout, the
+introduction command, report types (including the `0x09` tap-and-hold that opens
+the menu), settings, Flipper SDK gotchas and what's still open.
 
 ---
 
@@ -215,8 +209,8 @@ Nothing below has been verified against a physical G2 or Flipper.
    challenge/response auth before accepting a session; `g2proto` implements no
    auth step. If the glasses silently ignore the prelude, auth is the first
    suspect.
-4. **Unbound stand-in ring.** Unverified whether the glasses will accept an unbound
-   impostor ring (or the Flipper as a ring), and what the binding sequence is.
+4. **Unbound stand-in ring.** RESOLVED: the glasses accept the Flipper as a ring
+   via RING_CONNECT_INFO; see docs/R1-EMULATION.md §5.
 5. **Double-tap ergonomics.** The 250 ms window (also the latency added to every
    single tap) and the 500 ms / 100 ms scroll auto-repeat are chosen for feel and
    are unverified by hand.
@@ -226,6 +220,5 @@ Nothing below has been verified against a physical G2 or Flipper.
 7. **Flipper <-> relay GATT pairing** is a heuristic: the relay picks the first
    writable characteristic for TX and the first notifiable one for RX on the
    Serial profile.
-8. **R1-ring UUIDs.** The `bae80001-…` service and `bae80010/11`, `bae80012/13`
-   pairs appear nowhere in this repository; they are recorded as the plan, not as
-   verified repo content.
+8. **R1-ring UUIDs.** RESOLVED: verified on hardware and used by
+   flipper/apps/g2_ring; see docs/R1-EMULATION.md §4.
