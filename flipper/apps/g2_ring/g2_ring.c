@@ -123,6 +123,10 @@
 
 /* Deferred single-tap window (the one knob for tap feel). */
 #define DOUBLE_TAP_WINDOW_MS 250
+/* The Flipper GAP drops to slow (low-power) advertising 30 s after it starts,
+ * and the glasses' reconnect scan misses it. Restarting advertising every
+ * ADV_KICK_MS while no central is connected keeps it in the fast mode. */
+#define ADV_KICK_MS 25000
 /* OK = menu: hold, then release after MENU_HOLD_MS. */
 #define MENU_HOLD_MS        800
 /* The receiving side suppresses a report whose TICK advanced by < 100 ms, so we
@@ -290,6 +294,7 @@ struct G2RingApp {
 
     FuriMutex* mutex;   /* guards profile + last_report_ms + out buffer */
     FuriTimer* tap_timer;
+    FuriTimer* adv_timer; /* re-arms fast advertising while unconnected */
 
     G2RingProfile* profile;   /* set by profile start, cleared by profile stop */
     bool ok_tap_pending;      /* deferred single tap armed (GUI thread only) */
@@ -310,6 +315,7 @@ enum {
     G2RingEventDeferredTap = 1,
     G2RingEventSendBattery,
     G2RingEventSendRsp,
+    G2RingEventAdvKick,
 };
 
 /* Forward declaration: start() references the template, the template references
@@ -464,6 +470,22 @@ static void g2_ring_send_battery(G2RingApp* app) {
 }
 
 /* ---- deferred single tap (GUI thread) ---------------------------------- */
+
+static void g2_ring_adv_timer_callback(void* context) {
+    G2RingApp* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, G2RingEventAdvKick);
+}
+
+/* GUI thread. Never while connected: stopping advertising then would drop the link. */
+static void g2_ring_adv_kick(G2RingApp* app) {
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    bool idle = app->svc_ok && !app->central_connected;
+    furi_mutex_release(app->mutex);
+    if(!idle) return;
+    furi_hal_bt_stop_advertising();
+    furi_hal_bt_start_advertising();
+    FURI_LOG_D(TAG, "adv kick (fast advertising re-armed)");
+}
 
 static void g2_ring_tap_timer_callback(void* context) {
     G2RingApp* app = context;
@@ -1212,6 +1234,10 @@ static bool g2_ring_custom_event_callback(void* context, uint32_t event) {
         }
         return true;
     }
+    if(event == G2RingEventAdvKick) {
+        g2_ring_adv_kick(app);
+        return true;
+    }
     if(event == G2RingEventSendRsp) {
         g2_ring_send_rsps(app);
         return true;
@@ -1274,6 +1300,7 @@ int32_t g2_ring_app(void* p) {
     view_dispatcher_switch_to_view(app->view_dispatcher, APP_VIEW_MAIN);
 
     app->tap_timer = furi_timer_alloc(g2_ring_tap_timer_callback, FuriTimerTypeOnce, app);
+    app->adv_timer = furi_timer_alloc(g2_ring_adv_timer_callback, FuriTimerTypePeriodic, app);
 
     /* Take BLE over with our R1 impersonation profile. */
     app->bt = furi_record_open(RECORD_BT);
@@ -1315,12 +1342,15 @@ int32_t g2_ring_app(void* p) {
         if(have_mac) g2_ring_log(app, macline);
     }
 
+    furi_timer_start(app->adv_timer, furi_ms_to_ticks(ADV_KICK_MS));
     view_dispatcher_run(app->view_dispatcher);
 
     /* Teardown: stop+free timers BEFORE freeing the dispatcher/app, drop the
      * pending tap, then hand BLE back to the default profile cleanly. */
     furi_timer_stop(app->tap_timer);
     furi_timer_free(app->tap_timer);
+    furi_timer_stop(app->adv_timer);
+    furi_timer_free(app->adv_timer);
     app->ok_tap_pending = false;
     app->ok_long_active = false;
 
