@@ -42,6 +42,33 @@ Code: `flipper/apps/g2_ring/g2_ring.c`. PC helpers: `tools/g2-introducer/`.
    reply of `RingInfo{1:1}` means connected.
 4. Turn the phone back on. From now on, just open the app; the glasses find it.
 
+**If the glasses won't connect:**
+
+1. Make sure **G2 Ring** is open on the Flipper. Stock firmware can't auto-start an app,
+   so after a crash, restart or flat battery the ring is gone until you reopen it.
+   Making it a favourite (Settings → Desktop) makes reopening one click.
+2. Give it up to a minute. After a launch the first connect can wait for the 25 s
+   advertising refresh (§3).
+3. If the glasses still don't connect, they have forgotten the ring. Introduce it again
+   (step 3), with the phone's Bluetooth off for about a minute.
+
+With the phone's Bluetooth off, the glasses still connect to the ring but hang up after
+about 10 s (HCI reason `0x13`) and never send their 10 s `00 1A 94 01` check-ins. That is
+normal; the link holds once the phone is back.
+
+**What keeps the introduction** (tested 2026-11-26, phone on, fw 2.4.1.4). In each case
+the glasses reconnected with no PC:
+
+| Event | Reconnected |
+|---|---|
+| Glasses in the charging case and back out | on their own |
+| Ring app closed 15 min, then reopened | within seconds |
+| Ring app closed 2 h, then reopened | at once |
+| Flipper rebooted (`power reboot`), app reopened | about 27 s |
+
+The glasses did forget the ring once, on a day the Flipper crashed while away from the
+PC. None of the tests above reproduced it (§11).
+
 Button map (Flipper held sideways, RIGHT key on top):
 
 | Key | Report type | G2 action |
@@ -233,8 +260,10 @@ no accepted ring reply. Known pieces, in case someone continues:
 
 ## 11. Still open
 
-- Whether the ring MAC on the glasses survives long sleeps and reboots. It survived
-  app restarts and a minute off the face.
+- What made the glasses forget the ring on 2026-11-26. It survives the charging case,
+  app gaps up to 2 h and a Flipper reboot (§2). Untested: the glasses running flat, and
+  the Even app reconnecting away from home. If it happens with the Flipper on USB, its
+  log shows whether the glasses dialled at all.
 - Swipe `P1`/`P2` values (delta and speed). Zeros work.
 - Battery reporting is fixed at 100 %. The Flipper's real level could be sent.
 - What type `0x09` does on screens other than the dashboard.
